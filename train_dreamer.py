@@ -1,6 +1,5 @@
 """
 Battle City x DreamerV3 Training Script
-Uses the official dreamerv3.main() entry point with custom environment.
 """
 import warnings
 warnings.filterwarnings('ignore')
@@ -12,22 +11,22 @@ import sys
 if os.path.exists('/content/battle_city'):
     os.chdir('/content/battle_city')
 
-# Add current dir to path
 sys.path.insert(0, os.getcwd())
 
 def main():
     print("--- BATTLE CITY x DREAMER V3 ---")
     
-    # Import after path setup
+    # Imports
     import gymnasium as gym
     import numpy as np
+    import dreamerv3
+    import embodied  # Separate package!
+    
     from battle_city_env import BattleCityEnv
     from dreamer_wrapper import BattleCityDreamerWrapper
     
-    # Create a simple Gym-compatible wrapper
+    # Gym wrapper
     class BattleCityGymEnv(gym.Env):
-        """Gym-style wrapper for DreamerV3 compatibility."""
-        
         def __init__(self):
             super().__init__()
             self._env = BattleCityEnv(
@@ -37,8 +36,6 @@ def main():
                 use_vision=False
             )
             self._wrapper = BattleCityDreamerWrapper(self._env, size=(64, 64))
-            
-            # Dreamer expects specific spaces
             self.observation_space = gym.spaces.Dict({
                 'image': gym.spaces.Box(0, 255, (64, 64, 1), dtype=np.uint8),
             })
@@ -46,7 +43,6 @@ def main():
             
         def reset(self, seed=None, options=None):
             obs, info = self._wrapper.reset(seed=seed)
-            # Return only image for simplicity
             return {'image': obs['image']}, info
             
         def step(self, action):
@@ -56,21 +52,11 @@ def main():
         def close(self):
             self._env.close()
     
-    # Register environment
-    gym.register(
-        id='BattleCity-v0',
-        entry_point=lambda: BattleCityGymEnv(),
-    )
+    print("Creating environment...")
     
-    print("Environment registered as 'BattleCity-v0'")
-    
-    # Run DreamerV3 using command-line interface
-    import dreamerv3
-    from dreamerv3 import embodied
-    
-    # Configure
+    # Config
     config = embodied.Config(dreamerv3.Agent.configs['defaults'])
-    config = config.update(dreamerv3.Agent.configs['size12m'])  # Small model
+    config = config.update(dreamerv3.Agent.configs['size12m'])
     config = config.update({
         'logdir': './logs/dreamer',
         'run.train_ratio': 32,
@@ -82,46 +68,52 @@ def main():
         'decoder.cnn_keys': 'image',
     })
     
-    # Parse any CLI args
     config = embodied.Flags(config).parse()
     
-    # Setup logging
     logdir = embodied.Path(config.logdir)
     logdir.mkdir()
-    
     print(f"Logdir: {config.logdir}")
     
-    # Create environment
+    # Environment factory
     def make_env(index):
         env = BattleCityGymEnv()
-        env = embodied.envs.from_gymnasium.FromGymnasium(env)
+        # Use from_gymnasium adapter
+        from embodied.envs import from_gymnasium
+        env = from_gymnasium.FromGymnasium(env)
         return env
     
-    # Create parallel envs
+    # Batch envs (single process for stability)
     env = embodied.BatchEnv([lambda i=i: make_env(i) for i in range(2)], parallel=False)
     
-    # Create agent
+    print(f"Obs space: {env.obs_space}")
+    print(f"Act space: {env.act_space}")
+    
+    # Agent
     agent = dreamerv3.Agent(env.obs_space, env.act_space, config)
     
-    # Setup replay buffer
+    # Replay
     replay = embodied.replay.Replay(
         length=config.batch_length,
         capacity=config.replay.size,
         directory=logdir / 'replay',
     )
     
-    # Training loop
-    print("Starting training...")
+    # Logger
+    logger = embodied.Logger(logdir, [
+        embodied.logger.TerminalOutput(),
+    ])
     
+    # Training args
     args = embodied.Config(
         **config.run,
         logdir=config.logdir,
         batch_steps=config.batch_size * config.batch_length,
     )
     
-    embodied.run.train(agent, env, replay, logger=None, args=args)
+    print("Starting training...")
+    embodied.run.train(agent, env, replay, logger, args)
     
-    print("Training complete!")
+    print("Done!")
     env.close()
 
 if __name__ == "__main__":
