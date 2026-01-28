@@ -2,7 +2,7 @@
 import multiprocessing
 import os
 
-NUM_CPU = 1  # Используем 1 ядро для визуализации
+NUM_CPU = 8  # Используем все ядра для сбора опыта
 
 # --- HYBRID CONFIGURATION ---
 NUM_VIRTUAL = 2
