@@ -92,10 +92,10 @@ class BattleCityEnv(gym.Env):
         else:
             self.rew_kill = getattr(config, 'REW_KILL', 1.0)
             self.rew_death = getattr(config, 'REW_DEATH', -1.0)
-            self.rew_base = getattr(config, 'REW_BASE', -20.0)
-            self.rew_explore = getattr(config, 'REW_EXPLORE', 0.01)
+            self.rew_base = -100.0 # Make it EXTREMELY painful
+            self.rew_explore = getattr(config, 'REW_EXPLORE', 0.05) # Boost exploration
             self.rew_win = getattr(config, 'REW_WIN', 50.0)
-            self.rew_time = getattr(config, 'REW_TIME', -0.005)
+            self.rew_time = -0.0001 # Make "existing" almost free
             self.rew_dist = getattr(config, 'REW_DISTANCE', 0.01)
 
         # CONDITIONAL WIN REWARD
@@ -106,7 +106,7 @@ class BattleCityEnv(gym.Env):
              self.rew_win = 0.0 # No reward for clearing a partial/empty level
         
         self.rew_stuck = -0.001 
-        self.rew_brick = 0.0 
+        self.rew_brick = 0.1 # BIG Reward for breaking walls to encourage movement
         
         # self.rew_dist is loaded from config above (line 91 or 99)
         self.prev_min_dist = 999.0
@@ -257,6 +257,11 @@ class BattleCityEnv(gym.Env):
 
         self.idle_steps = 0
         self.prev_min_dist = 999.0 # Reset distance tracker
+        
+        # Track bricks for wall-breaking rewards
+        grid = self._get_tactical_map()
+        self.prev_brick_count = np.sum(grid == self.ID_MAP["brick"])
+        
         self.frames.clear()
         return self._get_obs(), {}
 
@@ -441,9 +446,18 @@ class BattleCityEnv(gym.Env):
         if base_status != 0: self.base_active_latch = True
         if self.base_active_latch and base_status == 0:
              terminated = True
-             reward += self.rew_base
+             reward -= 100.0 # EXTREME PENALTY for base destruction
              info['game_over_reason'] = 'base_destroyed'
-             info['reward_events'].append(f"BASE LOST ({self.rew_base})")
+             info['reward_events'].append("CRITICAL FAILURE: BASE DESTROYED (-100.0)")
+             
+        # 3.5 BRICK DESTRUCTION REWARD
+        # (Compare current world to previous to see if we opened a path)
+        curr_grid = self._get_tactical_map()
+        curr_brick_count = np.sum(curr_grid == self.ID_MAP["brick"])
+        if curr_brick_count < self.prev_brick_count:
+            reward += 0.05 * (self.prev_brick_count - curr_brick_count)
+            # info['reward_events'].append(f"BREACH (+0.05)")
+        self.prev_brick_count = curr_brick_count
 
         # 4. EXPLORATION REWARD
         curr_x, curr_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
@@ -672,8 +686,8 @@ class BattleCityEnv(gym.Env):
                 if 0 <= nx < 52 and 0 <= ny < 52:
                     if (nx, ny) not in visited:
                         val = grid_map[ny, nx]
-                        # Passable: 0 (empty), 80 (enemy), 150 (player)
-                        if val == 0 or val == 80 or val == 150:
+                        # Passable: 0 (empty), 80 (enemy), 150 (player), 200 (brick)
+                        if val == 0 or val == 80 or val == 150 or val == 200:
                             visited.add((nx, ny))
                             queue.append((nx, ny, dist + 1))
         

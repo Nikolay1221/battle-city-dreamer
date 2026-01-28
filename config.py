@@ -24,7 +24,7 @@ USE_TRANSFORMER = False
 # --- GLOBAL DEFAULT REWARDS ---
 REW_KILL = 1.0
 REW_DEATH = -1.0
-REW_BASE = -20.0
+REW_BASE = -100.0
 REW_EXPLORE = 0.01
 REW_WIN = 20.0
 REW_TIME = -0.005 # Штраф за каждый шаг (Голод), чтобы не стоял на месте
@@ -36,7 +36,7 @@ REWARD_VARIANTS = {
     "DEFAULT": {
         # Balanced: Map control (0.03 * 400 cells = 12 pts) is roughly equal to ~12 Kills.
         # Encourages moving out of base.
-        "kill": 1.0, "death": -1.0, "base": -1.0, "explore": 0.01, "win": 20.0, "time": -0.005, "distance": 0.01
+        "kill": 1.0, "death": -1.0, "base": -100.0, "explore": 0.05, "win": 20.0, "time": -0.0001, "distance": 0.01
     },
     "EXPLORER": {
         "kill": 0.1, "death": -0.5, "base": -5.0, "explore": 0.05, "win": 10.0, "time": -0.005, "distance": 0.01
