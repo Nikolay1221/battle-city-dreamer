@@ -9,12 +9,15 @@ import os
 import sys
 import threading
 
+# Add parent directory to path to import battle_city_env
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+# Apply nes-py NumPy 2.0 compatibility patch BEFORE importing BattleCityEnv
+import nes_py_patch  # noqa: F401
+
 import elements
 import embodied
 import numpy as np
-
-# Add parent directory to path to import battle_city_env
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 
 class BattleCity(embodied.Env):
@@ -25,7 +28,7 @@ class BattleCity(embodied.Env):
         self,
         task='stage0',
         repeat=4,
-        size=(52, 52),
+        size=(64, 64),
         gray=True,
         length=108000,
         seed=None,
