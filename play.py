@@ -5,6 +5,51 @@ import sys
 import os
 import pandas as pd
 from collections import deque
+import time
+
+def has_line_of_sight(p1, p2, grid):
+    x0, y0 = p1
+    x1, y1 = p2
+    
+    steps = max(abs(x1-x0), abs(y1-y0))
+    if steps == 0: return True
+    
+    # Check all points along the line
+    for i in range(1, steps + 1): 
+        t = i / steps
+        x = int(x0 + (x1 - x0) * t + 0.5)
+        y = int(y0 + (y1 - y0) * t + 0.5)
+        
+        if 0 <= y < 52 and 0 <= x < 52:
+             val = grid[y, x]
+             # Passable: 0(Empty), 80(Enemy), 150(Player), 200(Brick)
+             if not (val == 0 or val == 80 or val == 150 or val == 200):
+                 return False
+    return True
+
+def get_smoothed_path(path, grid_map):
+    if not path or len(path) < 3: return path
+    
+    smoothed = [path[0]]
+    idx = 0
+    # Greedy simplification
+    while idx < len(path) - 1:
+        found = False
+        # Look for furthest visible node
+        for i in range(len(path)-1, idx, -1):
+            if i == idx + 1: break # Neighbor always visible
+            
+            if has_line_of_sight(path[idx], path[i], grid_map):
+                smoothed.append(path[i])
+                idx = i
+                found = True
+                break
+        
+        if not found:
+            smoothed.append(path[idx+1])
+            idx += 1
+            
+    return smoothed
 
 # Ensure we can import battle_city_env
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -63,17 +108,21 @@ def main():
     # Path caching
     cached_path = []
     path_recalc_counter = 0
-    PATH_RECALC_INTERVAL = 10  # Recalculate every 10 frames
+    PATH_RECALC_INTERVAL = 1  # Recalculate EVERY frame
 
     msg_log = deque(maxlen=50) # Increased history
+    reward_log = deque(maxlen=20) # Лог наград
     popups = [] # List of [text, timer, color]
-    scroll_offset = 0 # For log scrolling
+    panel_scroll = 0 # Прокрутка всего бокового меню (в пикселях)
+    total_episode_reward = 0.0 # Накопленная награда за эпизод
 
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
             elif event.type == pygame.MOUSEWHEEL:
-                scroll_offset += event.y # Scroll up/down
+                panel_scroll -= event.y * 30 # Прокрутка всего меню (30px за тик)
+                if panel_scroll < 0: panel_scroll = 0
+                if panel_scroll > 600: panel_scroll = 600  # Максимум прокрутки
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE: running = False
                 elif event.key == pygame.K_m:
@@ -124,9 +173,23 @@ def main():
                 action = 5
                 
             obs, reward, terminated, truncated, info = env.step(action)
+            
+            # Накапливаем награду и логируем события
+            total_episode_reward += reward
+            events = info.get('reward_events', [])
+            for e in events:
+                # Определяем цвет по типу награды
+                if 'KILL' in e:
+                    reward_log.append(('🎯 ' + e, (0, 255, 100)))  # Зелёный
+                elif 'DIED' in e:
+                    reward_log.append(('💀 ' + e, (255, 80, 80)))  # Красный
+                elif 'BASE' in e:
+                    reward_log.append(('🦅 ' + e, (255, 0, 0)))  # Ярко-красный
 
         if terminated or truncated:
-            msg_log.append(f"EPISODE END (Score: {info.get('score', 0):.1f})")
+            msg_log.append(f"EPISODE END (Score: {info.get('score', 0):.1f}, Reward: {total_episode_reward:.2f})")
+            reward_log.append((f"=== EPISODE: {total_episode_reward:.2f} ===", (255, 255, 0)))
+            total_episode_reward = 0.0  # Сброс
             env.reset()
 
         # Render Game
@@ -139,42 +202,56 @@ def main():
         ram = env.raw_env.ram
         
         # Draw Player (from info or RAM)
+        # ALWAYS get raw coords for BFS pathfinding
+        px, py = ram[0x90], ram[0x98]
+        
         if 'player_cv' in info:
             px_c, py_c = info['player_cv']
-            px, py = px_c - 8, py_c - 8  # Center to top-left
+            # Correction: info adds +8, so we subtract 8 to get raw visual center
+            cx, cy = px_c - 8, py_c - 8 
         else:
-            px, py = ram[0x90], ram[0x98]
+            cx, cy = px, py # Raw coord seems to be visual center
         
-        pygame.draw.rect(screen, (0, 0, 255), (px*SCALE, py*SCALE, 16*SCALE, 16*SCALE), 2) # Blue Box
+        # SAVE player center (before cx, cy get overwritten by enemy loop!)
+        player_cx, player_cy = int(cx), int(cy)
+        
+        # Draw Player (Blue Dot)
+        pygame.draw.circle(screen, (0, 0, 255), (player_cx*SCALE, player_cy*SCALE), 4)
         lbl_player = font_mono.render("PLAYER", True, (0, 255, 255))
-        screen.blit(lbl_player, (px*SCALE, py*SCALE - 15))
+        screen.blit(lbl_player, (player_cx*SCALE - 15, player_cy*SCALE - 25))
         
         # Draw Enemies (from info with LoS)
         if 'enemy_positions' in info:
             for enemy_data in info['enemy_positions']:
-                ex, ey, slot_id, score, is_visible = enemy_data
-                ex_s, ey_s = ex - 8, ey - 8  # Center to top-left
-                
-                # Draw Box (Red)
-                pygame.draw.rect(screen, (255, 0, 0), (ex_s*SCALE, ey_s*SCALE, 16*SCALE, 16*SCALE), 2)
+                ex, ey, slot_id, st_val, is_visible = enemy_data
+                # Draw Point (Red Dot at Center)
+                # Correction: Visual center seems to match raw coord
+                cx, cy = ex, ey
+                pygame.draw.circle(screen, (255, 0, 0), (int(cx*SCALE), int(cy*SCALE)), 4)
                 
                 # Draw Label
                 status = "LoS" if is_visible else "X"
-                lbl = font_mono.render(f"#{slot_id} {status}", True, (255, 255, 0))
-                screen.blit(lbl, (ex_s*SCALE, ey_s*SCALE - 15))
+                if isinstance(st_val, (int, float)): # Check if it is status
+                    lbl = font_mono.render(f"#{slot_id} ST:{int(st_val):02X}", True, (255, 255, 0))
+                else:
+                    lbl = font_mono.render(f"#{slot_id} {status}", True, (255, 255, 0))
+                
+                screen.blit(lbl, (cx*SCALE - 10, cy*SCALE - 25))
         else:
-            # Fallback: Direct RAM
-            for i in range(1, 5):
-                if ram[0x60 + i] > 0:
+            # Fallback: Direct RAM (Slots 2-7)
+            for i in range(2, 8):
+                if ram[0xA0 + i] >= 128:
                     ex, ey = ram[0x90 + i], ram[0x98 + i]
-                    pygame.draw.rect(screen, (255, 0, 0), (ex*SCALE, ey*SCALE, 16*SCALE, 16*SCALE), 2)
+                    # Correction: Visual center seems to match raw coord (or close enough)
+                    cx, cy = ex, ey
+                    pygame.draw.circle(screen, (255, 0, 0), (cx*SCALE, cy*SCALE), 4)
                     lbl = font_mono.render(f"#{i}", True, (255, 255, 0))
-                    screen.blit(lbl, (ex*SCALE, ey*SCALE - 15))
+                    screen.blit(lbl, (cx*SCALE - 10, cy*SCALE - 25))
         
         # Render Side Panel Background
         pygame.draw.rect(screen, (30, 30, 30), (w*SCALE, 0, SIDE_PANEL, h*SCALE))
         x_start = w*SCALE + 20
-        y_pos = 20
+        y_pos = 20 - panel_scroll  # Применяем прокрутку
         
         # --- TACTICAL MAP ---
         screen.blit(font_ui.render("TACTICAL MAP (26x26)", True, (255, 255, 255)), (x_start, y_pos))
@@ -289,16 +366,19 @@ def main():
         y_pos += 20
         
         active_enemies = 0
-        for i in range(1, 5): # MAX 4 ENEMIES ON SCREEN
-            hp = ram[0x60 + i]
+        # Use slots 2-7 (Enemies)
+        for i in range(2, 8): 
+            st = ram[0xA0 + i] # Status (>=128 Alive)
             ex, ey = ram[0x90 + i], ram[0x98 + i]
             
-            if hp > 0:
+            is_alive = (st >= 128)
+            
+            if is_alive:
                 active_enemies += 1
-                txt = f"#{i}: HP={hp} | {ex:03d}, {ey:03d}"
+                txt = f"E#{i-1} [{ex:03},{ey:03}] ST:{st:02X}"
                 col = (255, 100, 100)
             else:
-                txt = f"#{i}: DEAD"
+                txt = f"E#{i-1} DEAD/EMPTY"
                 col = (80, 80, 80)
                 
             screen.blit(font_mono.render(txt, True, col), (x_start, y_pos))
@@ -314,21 +394,26 @@ def main():
         target_ex, target_ey = 0, 0
         
         dist_debug_lines = []
-        for i in range(1, 6):  # 5 slots
+        for i in range(2, 8):  # Slots 2-7
             ex, ey = float(ram[0x90 + i]), float(ram[0x98 + i])
+            st = int(ram[0xA0 + i])
             
-            # Skip empty slots (coords at 0,0)
-            if ex == 0 and ey == 0:
-                dist_debug_lines.append(f"#{i}: ---")
+            # Alive check: Status >= 128 AND Valid Coords
+            if st < 128 or (int(ex) == 0 and int(ey) == 0):
+                dist_debug_lines.append(f"#{i-1}: --- (ST:{st:02X})")
                 continue
             
-            px_f, py_f = float(px), float(py)
-            d = np.sqrt((ex - px_f)**2 + (ey - py_f)**2)
+            # Base Defense Logic: Target enemy closest to BASE (Eagle)
+            # Eagle is roughly at (12*8, 24*8) = (96, 192). Center ~ (104, 200).
+            bx, by = 104.0, 200.0
             
-            dist_debug_lines.append(f"#{i}: {d:.1f}")
+            # Distance to Base
+            d_base = np.sqrt((ex - bx)**2 + (ey - by)**2)
             
-            if d < min_dist:
-                min_dist = d
+            dist_debug_lines.append(f"#{i-1}: {d_base:.1f}")
+            
+            if d_base < min_dist:
+                min_dist = d_base
                 nearest_idx = i
                 target_ex, target_ey = ex, ey
         
@@ -338,68 +423,56 @@ def main():
              mag_txt = f"MAGNET: {min_dist:.1f} | P({px},{py})->E#{nearest_idx}({int(t_ex)},{int(t_ey)})"
              mag_col = (100, 255, 255) # Cyan
              
-             # --- PATHFINDING VISUALIZATION (BFS) ---
-             # Only recalculate every N frames for performance
-             path_recalc_counter += 1
+             # --- DIRECT LINE VISUALIZATION (Fast!) ---
+             # Draw lines from PLAYER to ALL alive enemies
+             player_screen_x = player_cx * SCALE
+             player_screen_y = player_cy * SCALE
              
-             if path_recalc_counter >= PATH_RECALC_INTERVAL:
-                 path_recalc_counter = 0
+             # Collect all enemies with distances
+             enemy_lines = []
+             for i in range(2, 8):  # All enemy slots
+                 st = int(ram[0xA0 + i])
+                 ex_i, ey_i = int(ram[0x90 + i]), int(ram[0x98 + i])
                  
-                 # 1. Get Grid (52x52)
-                 try:
-                     grid_map = env._get_tactical_map() # 0=Empty, >0=Obstacle
+                 # Skip dead/empty
+                 if st < 128 or (ex_i == 0 and ey_i == 0):
+                     continue
                  
-                     # 2. Convert Coords to Grid (52x52 over 208x208 play area)
-                     gx_start = int((px - 8) / 4)
-                     gy_start = int((py - 8) / 4)
-                     gx_end   = int((target_ex - 8) / 4)
-                     gy_end   = int((target_ey - 8) / 4)
-                     
-                     # Clip
-                     gx_start = max(0, min(51, gx_start))
-                     gy_start = max(0, min(51, gy_start))
-                     gx_end   = max(0, min(51, gx_end))
-                     gy_end   = max(0, min(51, gy_end))
-                     
-                     # 3. Quick BFS
-                     queue = [(gx_start, gy_start, [])]
-                     visited = set([(gx_start, gy_start)])
-                     path_found = []
-                     
-                     while queue:
-                         cx, cy, path = queue.pop(0)
-                         if cx == gx_end and cy == gy_end:
-                             path_found = path + [(cx, cy)]
-                             break
-                         
-                         if len(path) > 100: continue
-                         
-                         for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-                             nx, ny = cx+dx, cy+dy
-                             if 0 <= nx < 52 and 0 <= ny < 52:
-                                 if (nx, ny) not in visited:
-                                     val = grid_map[ny, nx]
-                                     if val == 0 or val == 80 or val == 150:
-                                         visited.add((nx, ny))
-                                         queue.append((nx, ny, path + [(cx, cy)]))
-                     
-                     # 4. Save to cache
-                     if path_found:
-                         cached_path = path_found
-                         
-                 except Exception as e:
-                     print(f"Pathfinding Error: {e}")
+                 # Calculate distance (line length)
+                 dx = ex_i - player_cx
+                 dy = ey_i - player_cy
+                 dist = (dx*dx + dy*dy) ** 0.5
+                 
+                 enemy_lines.append((i, ex_i, ey_i, dist))
              
-             # Draw cached path (always, even between recalcs)
-             if cached_path:
-                 points = []
-                 for (gx, gy) in cached_path:
-                     screen_x = (16 + gx * 4 + 2) * SCALE
-                     screen_y = (16 + gy * 4 + 2) * SCALE
-                     points.append((screen_x, screen_y))
+             # Find closest enemy (shortest line)
+             closest_idx = -1
+             if enemy_lines:
+                 closest_idx = min(enemy_lines, key=lambda x: x[3])[0]
+             
+             # Draw all lines
+             for (idx, ex_i, ey_i, dist) in enemy_lines:
+                 enemy_screen_x = ex_i * SCALE
+                 enemy_screen_y = ey_i * SCALE
                  
-                 if len(points) > 1:
-                     pygame.draw.lines(screen, (0, 255, 0), False, points, 2)
+                 # Closest = Green (priority), Others = Gray
+                 if idx == closest_idx:
+                     line_color = (0, 255, 0)  # Green
+                     line_width = 3
+                 else:
+                     line_color = (80, 80, 80)  # Gray
+                     line_width = 1
+                 
+                 pygame.draw.line(screen, line_color, 
+                                  (player_screen_x, player_screen_y),
+                                  (enemy_screen_x, enemy_screen_y), 
+                                  line_width)
+                 
+                 # Show distance label near midpoint
+                 mid_x = (player_screen_x + enemy_screen_x) // 2
+                 mid_y = (player_screen_y + enemy_screen_y) // 2
+                 dist_lbl = font_mono.render(f"{dist:.0f}", True, line_color)
+                 screen.blit(dist_lbl, (mid_x, mid_y))
 
         else:
              mag_txt = "MAGNET: NO TARGET"
@@ -441,41 +514,36 @@ def main():
              msg = f"EXPLORE: {explore_pct*100:.1f}%"
              
         screen.blit(font_mono.render(msg, True, (200, 200, 255)), (x_start + bar_w + 10, y_pos))
-        y_pos += 30
+        y_pos += 25
         
-        # --- SCROLLABLE LOG ---
-        # Show last 10 messages with scroll offset
-        log_list = list(msg_log)
-        # Apply scroll
-        # Scroll 0 = Show newest at bottom. 
-        # Scroll > 0 = Look back in history.
+        # --- REWARDS LOG (Прокручиваемый) ---
+        steps = env.steps_in_episode
+        time_reward = steps * 0.001
+        screen.blit(font_ui.render(f"REWARDS: Total={total_episode_reward:+.2f} | ⏱️ TIME={time_reward:+.2f}", True, (255, 215, 0)), (x_start, y_pos))
+        y_pos += 20
         
-        max_visible = 10
-        total_logs = len(log_list)
+        # Показываем последние N наград
+        reward_list = list(reward_log)
+        visible_rewards = reward_list[-8:]  # Последние 8 записей
         
-        # Clamp scroll
-        max_scroll = max(0, total_logs - max_visible)
-        if scroll_offset > max_scroll: scroll_offset = max_scroll
-        if scroll_offset < 0: scroll_offset = 0
+        for (txt, col) in visible_rewards:
+            screen.blit(font_mono.render(txt, True, col), (x_start, y_pos))
+            y_pos += 16
         
-        # Determine slice
-        # If scroll is 0, we want indices [-10:]
-        # If scroll is 1, we want indices [-11:-1]
-        start_idx = total_logs - max_visible - scroll_offset
-        if start_idx < 0: start_idx = 0
-        end_idx = start_idx + max_visible
+        y_pos += 10
         
-        visible_logs = log_list[start_idx:end_idx]
-        
-        screen.blit(font_ui.render(f"EVENT LOG ({scroll_offset}/{max_scroll}) [Wheel to Scroll]", True, (200, 200, 0)), (x_start, y_pos))
+        # --- EVENT LOG ---
+        screen.blit(font_ui.render("EVENT LOG", True, (200, 200, 0)), (x_start, y_pos))
         y_pos += 20
 
+        # Показываем последние 10 сообщений
+        visible_logs = list(msg_log)[-10:]
         for msg in visible_logs:
             screen.blit(font_mono.render(msg, True, (150, 150, 150)), (x_start, y_pos))
             y_pos += 20
 
         pygame.display.flip()
-        clock.tick(60)
+        clock.tick(30)
 
     env.close()
     pygame.quit()

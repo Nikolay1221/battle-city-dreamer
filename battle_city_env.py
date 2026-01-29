@@ -78,38 +78,15 @@ class BattleCityEnv(gym.Env):
         self.ram_stack = deque(maxlen=self.STACK_SIZE)
         self.frames = deque(maxlen=self.STACK_SIZE)
 
-        # Rewards Configuration
-        # Rewards Configuration
-        # If reward_config is passed (from Multi-Env setup), use it. Else default to config.py defaults.
-        if reward_config:
-            self.rew_kill = reward_config.get('kill', 1.0)
-            self.rew_death = reward_config.get('death', -1.0)
-            self.rew_base = reward_config.get('base', -20.0)
-            self.rew_explore = reward_config.get('explore', 0.01)
-            self.rew_win = reward_config.get('win', 20.0)
-            self.rew_time = reward_config.get('time', -0.005) # Default if missing in config
-            self.rew_dist = reward_config.get('distance', 0.01)
-        else:
-            self.rew_kill = getattr(config, 'REW_KILL', 1.0)
-            self.rew_death = getattr(config, 'REW_DEATH', -1.0)
-            self.rew_base = -100.0 # Make it EXTREMELY painful
-            self.rew_explore = getattr(config, 'REW_EXPLORE', 0.05) # Boost exploration
-            self.rew_win = getattr(config, 'REW_WIN', 50.0)
-            self.rew_time = -0.0001 # Make "existing" almost free
-            self.rew_dist = getattr(config, 'REW_DISTANCE', 0.01)
-
-        # CONDITIONAL WIN REWARD
-        # Only grant win reward if this is a "Full" game (20 enemies)
-        if self.enemy_count >= 20:
-             self.rew_win = getattr(config, 'REW_WIN', 50.0)
-        else:
-             self.rew_win = 0.0 # No reward for clearing a partial/empty level
+        # SIMPLE REWARD SYSTEM
+        # ========================================
+        # Kill: +1, Death: -1, Base Lost: -20
+        # That's it. No tricks.
+        # ========================================
         
-        self.rew_stuck = -0.001 
-        self.rew_brick = 0.1 # BIG Reward for breaking walls to encourage movement
-        
-        # self.rew_dist is loaded from config above (line 91 or 99)
-        self.prev_min_dist = 999.0
+        self.rew_kill = 1.0        # +1 за убийство врага
+        self.rew_death = -1.0      # -1 за смерть (симметрично с kill)
+        self.rew_base_lost = -20.0 # -20 за потерю базы
 
         # RAM Addresses
         self.ADDR_LIVES = 0x51
@@ -300,179 +277,96 @@ class BattleCityEnv(gym.Env):
         
         # 0. State Tracking for Rewards
         current_enemies = []
-        for i in range(1, 7): # Slots 1-6
-            e_hp = int(ram[0x60 + i]) if 0x60 + i < 0x100 else 0
+        # Enemies are at slots 2-7 (Indices in RAM arrays)
+        # Slot 0 = P1, Slot 1 = P2, Slots 2-7 = Enemies
+        for i in range(2, 8): 
+            # Check Status at 0xA0 + i
+            # Status >= 0x80 means active tank. < 0x80 means empty or exploding.
+            if 0xA0 + i < 0x100:
+                st = int(ram[0xA0 + i])
+                e_hp = 1 if st >= 128 else 0 
+                # Optional: Check Armor at 0xA8 + i for armored tanks?
+                # But simple Alive/Dead is enough for rewards.
+            else:
+                e_hp = 0
+                
             e_x  = int(ram[0x90 + i]) if 0x90 + i < 0x100 else 0
             e_y  = int(ram[0x98 + i]) if 0x98 + i < 0x100 else 0
-            current_enemies.append({'hp': e_hp, 'x': e_x, 'y': e_y})
+            current_enemies.append({'hp': e_hp, 'x': e_x, 'y': e_y, 'id': i})
 
-        # 1. Kill Rewards
-        curr_kill_sum = sum([int(ram[addr]) for addr in self.ADDR_KILLS])
-        diff = curr_kill_sum - self.prev_kill_sum
+        # ========================================
+        # OPTIMIZED REWARD LOGIC
+        # ========================================
         
         info['reward_events'] = [] # For visualization
         
+        # --- REWARD 1: KILLS (+1 per kill) ---
+        curr_kill_sum = sum([int(ram[addr]) for addr in self.ADDR_KILLS])
+        diff = curr_kill_sum - self.prev_kill_sum
+        
         if diff > 0:
-            reward += self.rew_kill * diff
+            reward += self.rew_kill * diff  # +1.0 per kill
             self.episode_kills += diff
-            info['reward_events'].append(f"KILL (+{self.rew_kill})")
+            info['reward_events'].append(f"KILL (+{self.rew_kill * diff})")
             
-            # --- KILL MILESTONES (VOLUME BONUS) ---
-            # ... (Milestone logic same as before) ...
-            
-            milestones = {
-                2: 1.0,  # "Double Kill" equivalent
-                5: 2.0,  # "Rampage"
-                8: 5.0   # "Dominating"
-            }
-            
-            if self.episode_kills in milestones:
-                bonus = milestones[self.episode_kills]
-                reward += bonus
-                info['reward_events'].append(f"KILL MILESTONE {self.episode_kills} (+{bonus})")
-
-            # --- BASE DEFENSE BONUS (Advanced) ---
-            # If we have history (not first step)
-            if hasattr(self, 'prev_enemies') and self.prev_enemies:
-                for i in range(6):
-                    prev = self.prev_enemies[i]
-                    curr = current_enemies[i]
-                    
-                    # Logic: Enemy WAS alive, NOW is dead (or respawning/gone)
-                    # Note: When dead, HP becomes 0.
-                    if prev['hp'] > 0 and curr['hp'] == 0:
-                        # This guy died. Was he a threat?
-                        dist = np.sqrt((prev['x'] - self.BASE_X)**2 + (prev['y'] - self.BASE_Y)**2)
-                        if dist < 60:
-                            reward += 0.5
-                            info['reward_events'].append("DEFENDER (+0.5)")
-            
-        # Update history unconditionally
-        self.prev_enemies = current_enemies
         self.prev_kill_sum = curr_kill_sum
         
-        # --- ANTI-HACK MEASURES (ROBUSTNESS) ---
+        # --- REWARD 2: DEATH (-1 per death) ---
+        curr_lives = int(ram[self.ADDR_LIVES])
+        if curr_lives < 10 and self.prev_lives < 10:
+             if curr_lives < self.prev_lives:
+                reward += self.rew_death  # -2.0 per death
+                info['reward_events'].append(f"DIED ({self.rew_death})")
+        self.prev_lives = curr_lives
         
-        # 1. ABANDONMENT PENALTY
-        # If an enemy is threatening the base (dist < 50) AND player is far away (dist > 80),
-        # punish the player for not defending.
-        min_enemy_dist = 999.0
-        if current_enemies:
-            # Filter alive ones
-            alive_dists = [np.sqrt((e['x'] - self.BASE_X)**2 + (e['y'] - self.BASE_Y)**2) for e in current_enemies if e['hp'] > 0]
-            if alive_dists:
-                min_enemy_dist = min(alive_dists)
+        # ========================================
+        # GAME STATE CHECKS (no reward, just termination)
+        # ========================================
         
-        p_x, p_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
-        player_dist = np.sqrt((p_x - self.BASE_X)**2 + (p_y - self.BASE_Y)**2)
-        
-        if min_enemy_dist < 50 and player_dist > 80:
-             reward -= 0.05
-             # Don't spam log, maybe just once in a while or implicit
-        
-        # 2. IDLE / COWARDICE PENALTY
-        # If we are idling (no explore, no kills) for too long, we punish before reset.
-        if self.idle_steps > 3000:
-             truncated = True
-             reward -= 5.0 # "Boredom" penalty
-             info['game_over_reason'] = 'idle_timeout'
-             info['reward_events'].append("IDLE TIMEOUT (-5.0)")
-
-        # CHECK FOR VICTORY
-        # ...
         curr_stage = int(ram[self.ADDR_STAGE])
         
-        # 1. TIME PENALTY (HUNGER)
-        # Force agent to solve the level quickly. 1000 steps = -5.0 score.
-        if self.enemy_count >= 20 and not self.level_cleared:
-             reward += self.rew_time
-        
-        # 2. PATH-BASED REWARD (Smart Magnet)
-        # Instead of Euclidean distance, use BFS path length
-        self.path_recalc_counter += 1
-        
-        if self.path_recalc_counter >= self.PATH_RECALC_INTERVAL:
-            self.path_recalc_counter = 0
-            # Find nearest enemy and calculate path length
-            new_path_length = self._get_path_length_to_nearest_enemy(p_x, p_y, current_enemies)
-            
-            if new_path_length < self.cached_path_length and new_path_length < 200:
-                reward += self.rew_dist  # Moved closer along path!
-                info['reward_events'].append(f"PATH (+{self.rew_dist})")
-            
-            self.cached_path_length = new_path_length
+        # Victory: killed 20 enemies or stage changed
+        if self.enemy_count >= 20 and self.episode_kills >= 20 and not self.level_cleared:
+            self.level_cleared = True
+            terminated = True 
+            info['is_success'] = True
+            info['win_reason'] = 'kills_limit'
 
-        # Condition 1: Kills Limit (Only if full game)
-        # If enemy_count < 20, we don't grant win for killing all (because there aren't 20)
-        # unless we explicitly want to logic that out. 
-        # Currently requested: "REW_WIN = 20.0 начислять не будем" if < 20.
-        if self.enemy_count >= 20: 
-            if self.episode_kills >= 20 and not self.level_cleared:
-                reward += self.rew_win
-                self.level_cleared = True
-                terminated = True 
-                info['is_success'] = True
-                info['win_reason'] = 'kills_limit'
-
-        # Condition 2: Stage Changed
-        # This means the internal game logic is happy (all enemies dead).
         if curr_stage != self.prev_stage:
-             # Only grant the BIG reward if it was a full game
              if not self.level_cleared and self.enemy_count >= 20:
-                 reward += self.rew_win
                  self.level_cleared = True
                  info['is_success'] = True
                  info['win_reason'] = 'stage_cleared'
-             
-             # Terminate regardless
              terminated = True
              
         self.prev_stage = curr_stage
         
-        # 2. Death
-        curr_lives = int(ram[self.ADDR_LIVES])
-        if curr_lives < 10 and self.prev_lives < 10:
-             if curr_lives < self.prev_lives:
-                reward += self.rew_death
-                info['reward_events'].append(f"DIED ({self.rew_death})")
-        self.prev_lives = curr_lives
-        
-        # 3. Game Over Checks
+        # Game Over: no lives
         if curr_lives == 0:
             terminated = True
             info['game_over_reason'] = 'no_lives'
 
+        # Game Over: base destroyed
         base_status = int(ram[self.ADDR_BASE_STATUS])
         if base_status != 0: self.base_active_latch = True
         if self.base_active_latch and base_status == 0:
              terminated = True
-             reward -= 100.0 # EXTREME PENALTY for base destruction
+             reward += self.rew_base_lost  # -5.0 for losing base!
              info['game_over_reason'] = 'base_destroyed'
-             info['reward_events'].append("CRITICAL FAILURE: BASE DESTROYED (-100.0)")
+             info['reward_events'].append(f"BASE DESTROYED ({self.rew_base_lost})")
              
-        # 3.5 BRICK DESTRUCTION REWARD
-        # (Compare current world to previous to see if we opened a path)
-        curr_grid = self._get_tactical_map()
-        curr_brick_count = np.sum(curr_grid == self.ID_MAP["brick"])
-        if curr_brick_count < self.prev_brick_count:
-            reward += 0.05 * (self.prev_brick_count - curr_brick_count)
-            # info['reward_events'].append(f"BREACH (+0.05)")
-        self.prev_brick_count = curr_brick_count
-
-        # 4. EXPLORATION REWARD
+        # Track position for game mechanics (idle detection for truncation)
         curr_x, curr_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
-        
         if abs(curr_x - old_x) > 2 or abs(curr_y - old_y) > 2:
-             sec_x, sec_y = curr_x // 16, curr_y // 16
-             if (sec_x, sec_y) not in self.visited_sectors:
-                 reward += self.rew_explore
-                 self.visited_sectors.add((sec_x, sec_y))
-                 info['reward_events'].append(f"EXPLORE (+{self.rew_explore})")
+             self.visited_sectors.add((curr_x // 16, curr_y // 16))
              self.idle_steps = 0
         else:
-             if action != 0: 
-                 reward += self.rew_stuck
              self.idle_steps += 1
+             
+        # Idle timeout (truncation, no penalty)
+        if self.idle_steps > 5000:
+             truncated = True
+             info['game_over_reason'] = 'idle_timeout'
         
         # --- AMBUSH LOGIC & ENEMY CONTROL ---
         
@@ -489,46 +383,42 @@ class BattleCityEnv(gym.Env):
                     # Teleport existing "held" enemies to battle positions
                     # Spawn X Coords: 0, 128, 192 (Approximate standard spawns)
                     spawn_x = [0, 128, 192]
-                    for i in range(1, 7):
-                        if ram[0x60 + i] > 0: # If alive (was held)
-                             target_x = spawn_x[(i-1) % 3]
+                    for i in range(2, 8): # Slots 2-7
+                        if ram[0xA0 + i] >= 128: # If alive
+                             target_x = spawn_x[(i-2) % 3]
                              self.raw_env.ram[0x90 + i] = target_x # X
                              self.raw_env.ram[0x98 + i] = 0        # Y (Top)
                 
                 else:
                     # --- PRE-AMBUSH SUPPRESSION ---
                     # Keep enemies alive but trapped/hidden at (0,0)
-                    for i in range(1, 7):
-                         # Slots 1-4 have HP. Slots 5-6 might be coords-only (stars/glitches).
+                    for i in range(2, 8):
+                         # Slots 2-5 have HP/Status. 
                          should_suppress = False
                          
-                         if i <= 4:
-                             if ram[0x60 + i] > 0: should_suppress = True
-                         else:
-                             should_suppress = True # Unconditional for ghosts
+                         if ram[0xA0 + i] >= 128: should_suppress = True
                              
                          if should_suppress:
                               self.raw_env.ram[0x90 + i] = 0
                               self.raw_env.ram[0x98 + i] = 0
         
-        # 2. STANDARD LIMIT (For non-Ambush limited modes like VERY_EASY)
-        # Only apply if we are NOT in pre-ambush suppression (since suppression handles it).
-        # OR if Ambush is active, we might still want to limit to 5 enemies?
-        # Yes, obey self.enemy_count.
-        
+        # 2. STANDARD LIMIT
         apply_standard_limit = True
         if self.exploration_trigger is not None and not self.ambush_triggered:
              apply_standard_limit = False # Suppression already handling it
              
         if apply_standard_limit and self.enemy_count < 6:
-             for i in range(self.enemy_count + 1, 7):
-                 if 0x90 + i < 0x100: 
+             # Kill excess slots
+             # Slots 2..7. If we want N enemies max.
+             # e.g. Count=2. We allow slots 2,3. Kill 4,5,6,7.
+             limit_idx = 2 + self.enemy_count 
+             for i in range(limit_idx, 8):
+                 if 0xA0 + i < 0x100: 
                       self.raw_env.ram[0x90 + i] = 0
                       self.raw_env.ram[0x98 + i] = 0
-                      #Kill excess beyond limit (standard behavior)
-                      self.raw_env.ram[0x60 + i] = 0
+                      self.raw_env.ram[0xA0 + i] = 0 # Kill status
              
-             # Special Case: If 0 enemies, we also prevent idle timeouts
+             # Special Case: If 0 enemies
              if self.enemy_count == 0:
                  self.idle_steps = 0 
         
@@ -574,10 +464,12 @@ class BattleCityEnv(gym.Env):
         # 1. Reset spawn counter
         self.raw_env.ram[self.ADDR_ENEMIES_LEFT] = 0
         # 2. Reset on-screen counter
-        self.raw_env.ram[self.ADDR_ENEMIES_ON_SCREEN] = 0
-        # 3. Optional: Zero out enemy HPs 
-        for i in range(1, 5):
-            self.raw_env.ram[0x60 + i] = 0
+        self.raw_env.ram[0x64] = 0 # TanksOnScreen address is actually not 0xA0, usually managed by engine.
+        # But we can kill individual tanks.
+        for i in range(2, 8):
+            self.raw_env.ram[0xA0 + i] = 0 # Status = 0 (Dead)
+            self.raw_env.ram[0x90 + i] = 0 # X=0
+            self.raw_env.ram[0x98 + i] = 0 # Y=0
             
     def close(self):
         self.env.close()
@@ -598,14 +490,19 @@ class BattleCityEnv(gym.Env):
         py = int(ram[0x98])
         player_pos = (px + 8, py + 8)  # Center of tank
         
-        # 2. Enemies (Slots 1-4)
+        # 2. Enemies (Slots 2-7) - Battle City Standard
         enemies = []
         
-        for i in range(1, 6):  # 5 slots (Battle City can use slot 5 sometimes)
+        for i in range(2, 8):  # Slots 2-7
+            # Check Status (Alive >= 128)
+            status = int(ram[0xA0 + i]) if 0xA0 + i < 0x100 else 0
+            if status < 128:
+                 continue
+                 
             ex = int(ram[0x90 + i])
             ey = int(ram[0x98 + i])
             
-            # Skip empty slots (coords at 0,0)
+            # Skip empty slots (coords at 0,0) - Redundant if Status checked, but safe
             if ex == 0 and ey == 0:
                 continue
             
@@ -629,8 +526,10 @@ class BattleCityEnv(gym.Env):
                             is_visible = False
                             break
             
-            # Format: (x_center, y_center, slot_id, confidence, is_visible)
-            enemies.append((ex + 8, ey + 8, i, 1.0, is_visible))
+            
+            # Format: (x_topleft, y_topleft, slot_id, status_byte, is_visible)
+            # Send raw coords (no +8)
+            enemies.append((ex, ey, i, status, is_visible))
             
         return player_pos, enemies
 

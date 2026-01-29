@@ -194,6 +194,10 @@ bsuite:
 battlecity:
   task: battlecity_stage0
   run: {steps: 5e6, envs: 8, train_ratio: 32}
+  agent:
+    imag_length: 25           # Longer imagination (see further into future)
+    horizon: 500              # Longer discount horizon (more long-term thinking)
+    imag_loss: {slowtar: False, lam: 0.95, actent: 0.001, slowreg: 1.0}  # More exploration
 
 loconav:
   task: loconav_ant_maze_m
