@@ -84,7 +84,7 @@ class BattleCityEnv(gym.Env):
         # That's it. No tricks.
         # ========================================
         
-        self.rew_kill = 1.0        # +1 за убийство врага
+        self.rew_kill = 5.0        # +5 за убийство (BOOTSTRAP: чтобы риск окупался!)
         self.rew_death = -1.0      # -1 за смерть (симметрично с kill)
         self.rew_base_lost = -20.0 # -20 за потерю базы
 
