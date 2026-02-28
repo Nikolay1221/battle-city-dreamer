@@ -1,593 +1,378 @@
-import gymnasium as gym
-from gymnasium import spaces
+import gym
+from gymnasium import spaces as gymnasium_spaces
+import numpy as np
+import cv2
 from nes_py import NESEnv
 from nes_py.wrappers import JoypadSpace
-import numpy as np
-from collections import deque
-import os
-import cv2 
-import config 
+from config import RLConfig
 
-class BattleCityEnv(gym.Env):
-    metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
 
-    def __init__(self, rom_path=config.ROM_PATH, render_mode=None, use_vision=False, stack_size=4, target_stage=None, enemy_count=20, no_shooting=False, reward_config=None, exploration_trigger=None):
-        super().__init__()
+# Define simple actions: Move and Fire
+# Battle City controls: arrows for movement, A/B for fire.
+# We'll combine movement + fire for efficiency.
+COMPLEX_MOVEMENT = [
+    ['NOOP'],
+    ['up'],
+    ['down'],
+    ['left'],
+    ['right'],
+    ['A'],
+    ['up', 'A'],
+    ['down', 'A'],
+    ['left', 'A'],
+    ['right', 'A'],
+]
+
+class MultiDiscreteActionSpaceWrapper(gym.ActionWrapper):
+    """
+    Wraps the BattleCityEnv JoypadSpace (which has 10 discrete actions)
+    into a MultiDiscrete([5, 2]) action space.
+    Action[0] Movement: 0=NOOP, 1=up, 2=down, 3=left, 4=right
+    Action[1] Fire: 0=NOOP, 1=A
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        self.action_space = gymnasium_spaces.MultiDiscrete([5, 2])
         
-        self.rom_path = rom_path
+    def action(self, act):
+        # act is [mov_idx, fire_idx]
+        mov, fire = act[0], act[1]
+        
+        if fire == 0:
+            return mov
+        else:
+            if mov == 0:
+                return 5
+            else:
+                return mov + 5
+
+class BattleCityEnv(gym.Wrapper):
+    def __init__(self, render_mode=None, is_visible=False, start_level=None):
+        # Create base NES environment
+        env = NESEnv(RLConfig.GAME_PATH)
+        
+        # Apply Joypad wrapper to discrete actions
+        env = JoypadSpace(env, COMPLEX_MOVEMENT)
+        
+        # Apply MultiDiscrete wrapper to separate movement and fire
+        env = MultiDiscreteActionSpaceWrapper(env)
+        
+        # Use gym.Wrapper
+        super().__init__(env)
+        
+        # Store render_mode locally. 
+        # We don't set it on env because JoypadSpace might block it (property)
+        # Store render_mode locally. 
         self.render_mode = render_mode
-        self.USE_VISION = use_vision
-        self.STACK_SIZE = stack_size
-        self.target_stage = target_stage
+        self.is_visible = is_visible
+        self.start_level = start_level
+        # Fix for Gymnasium expecting string keys dict instead of module reference from nested gym envs
+        self.__dict__['metadata'] = {'render_modes': ['human', 'rgb_array']}
         
-        self.MAX_STEPS = 100_000_000 
+        # Explicity convert old gym spaces to new gymnasium spaces 
+        # so EnvCompatibility doesn't choke later.
+        self.observation_space = gymnasium_spaces.Box(low=0, high=255, shape=(128, 128, 1), dtype=np.uint8)
+        
+        # We applied MultiDiscreteActionSpaceWrapper which sets correct gymnasium MultiDiscrete space.
+        # No need to overwrite it with Discrete(n) here anymore, let's just make sure action_space is carried over correctly.
+        if hasattr(self.env, 'action_space'):
+             self.action_space = self.env.action_space
+
+        
+        # Trackers
+        self.prev_kills = [0] * 4
+        self.cumulative_kills = 0
+        self.prev_lives = 0
         self.steps_in_episode = 0
         
-        # New Mechanics
-        self.enemy_count = enemy_count
-        self.no_shooting = no_shooting
-        self.exploration_trigger = exploration_trigger 
-        self.ambush_triggered = False
-        
-        if not os.path.exists(self.rom_path):
-            raise FileNotFoundError(f"ROM file not found at: {self.rom_path}")
-
-        self.raw_env = NESEnv(self.rom_path)
-        
-        # Define Actions
-        self.actions_list = [
-            ['NOOP'],
-            ['up'], ['down'], ['left'], ['right'],
-            ['A'], # Fire
-            ['up', 'A'], ['down', 'A'], ['left', 'A'], ['right', 'A']
-        ]
-        
-        self.env = JoypadSpace(self.raw_env, self.actions_list)
-        self.action_space = spaces.Discrete(len(self.actions_list))
-
-        # Tactical Grid Settings (High Res: 52x52)
-        self.GRID_SIZE = 52 
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.GRID_SIZE, self.GRID_SIZE, self.STACK_SIZE), dtype=np.uint8)
-        
-        # Color definitions (RGB) for visual scanning
-        self.TILE_COLORS = {
-            "brick": np.array([228, 92, 16]), 
-            "brick_dark": np.array([168, 16, 0]), 
-            "empty": np.array([0, 0, 0]),
-            "eagle": np.array([60, 90, 60]), 
-            "steel": np.array([124, 124, 124]),
-            "player": np.array([232, 208, 32]), 
-            "enemy_silver": np.array([180, 180, 180]),
-            "enemy_red": np.array([168, 0, 32]),
-            "bullet": np.array([255, 255, 255]) 
-        }
-        self.known_labels = list(self.TILE_COLORS.keys())
-        self.known_colors = np.array(list(self.TILE_COLORS.values()), dtype=np.float32)
-
-        # ID Mapping - GRAYSCALE INTENSITY
-        self.ID_MAP = {
-            "empty": 0,
-            "brick": 200,   
-            "steel": 255,   
-            "eagle": 255,   
-            "player": 150,  
-            "enemy": 80,    
-            "bullet": 255   
-        }
-        
-        self.ram_stack = deque(maxlen=self.STACK_SIZE)
-        self.frames = deque(maxlen=self.STACK_SIZE)
-
-        # SIMPLE REWARD SYSTEM
-        # ========================================
-        # Kill: +1, Death: -1, Base Lost: -20
-        # That's it. No tricks.
-        # ========================================
-        
-        self.rew_kill = 5.0        # +5 за убийство (BOOTSTRAP: чтобы риск окупался!)
-        self.rew_death = -1.0      # -1 за смерть (симметрично с kill)
-        self.rew_base_lost = -20.0 # -20 за потерю базы
-
-        # RAM Addresses
-        self.ADDR_LIVES = 0x51
-        self.ADDR_STATE = 0x92
-        self.ADDR_BASE_STATUS = 0x68 # NEW: Base Latch Address
-        self.ADDR_ENEMIES_LEFT = 0x80 # Enemies remaining to spawn
-        self.ADDR_ENEMIES_ON_SCREEN = 0xA0 # Enemies currently active
-        self.ADDR_KILLS = [0x73, 0x74, 0x75, 0x76] 
-        self.ADDR_SCORE = [0x70, 0x71, 0x72] 
-        self.ADDR_BONUS = 0x62
-        self.ADDR_STAGE = 0x85
-        self.ADDR_MAP = 0x0731
-        self.ADDR_BASE_TILE = 0x07D3
-        self.ADDR_X_ARR = 0x90 
-        self.ADDR_Y_ARR = 0x98
-        
-        self.prev_lives = 3
-        self.prev_kill_sum = 0
-        self.prev_score_sum = 0
-        self.prev_x = 0
-        self.prev_y = 0
-        self.idle_steps = 0
-        self.visited_sectors = set()
-        
-        self.episode_kills = 0 
-        self.level_cleared = False
-        self.base_active_latch = False # NEW: Latch for base status
-        
-        # --- EXPERIMENTAL REWARDS ---
-        self.last_kill_step = -9999
-        self.kill_streak = 0
-        
-        # Base Coordinates (Approx, in 52x52 grid or higher? Use RAM)
-        # Base is at 120, 216 roughly. 
-        # In RAM coords (0x90, 0x98): X~120, Y~208-216?
-        # Let's use scalar distance.
-        self.BASE_X = 120
-        self.BASE_Y = 216
-        self.prev_enemies = [] # Track enemy state for defense logic
-        
-        # Path-Based Reward Cache
-        self.cached_path_length = 999
-        self.path_recalc_counter = 0
-        self.PATH_RECALC_INTERVAL = 5  # Recalculate every 5 steps
-
-
-    def _get_tactical_map(self):
-        """Creates a 52x52 GRAYSCALE matrix representing the game state (VISUAL ONLY)."""
-        grid = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.uint8)
-        frame_rgb = self.raw_env.screen
-        
-        # 1. SCAN TERRAIN (Visual)
-        screen_area = frame_rgb[16:224, 16:224]
-        tiles = screen_area.reshape(self.GRID_SIZE, 4, self.GRID_SIZE, 4, 3).transpose(0, 2, 1, 3, 4)
-        tiles_flat = tiles.reshape(self.GRID_SIZE, self.GRID_SIZE, 16, 3).astype(np.float32)
-        
-        diffs = tiles_flat[..., np.newaxis, :] - self.known_colors
-        dists = np.sum(diffs**2, axis=-1)
-        labels = np.argmin(dists, axis=-1)
-        mask_bg = np.max(tiles_flat, axis=-1) > 40
-        
-        # Indices
-        idx_brick = self.known_labels.index("brick")
-        idx_brick_dark = self.known_labels.index("brick_dark")
-        idx_steel = self.known_labels.index("steel")
-        idx_eagle = self.known_labels.index("eagle")
-        idx_player = self.known_labels.index("player")
-        idx_enemy_s = self.known_labels.index("enemy_silver")
-        idx_enemy_r = self.known_labels.index("enemy_red")
-        idx_bullet = self.known_labels.index("bullet")
-        
-        # Count pixels per cell
-        count_brick = np.sum(((labels == idx_brick) | (labels == idx_brick_dark)) & mask_bg, axis=2)
-        count_steel = np.sum((labels == idx_steel) & mask_bg, axis=2)
-        count_eagle = np.sum((labels == idx_eagle) & mask_bg, axis=2)
-        count_player = np.sum((labels == idx_player) & mask_bg, axis=2)
-        count_enemy = np.sum(((labels == idx_enemy_s) | (labels == idx_enemy_r)) & mask_bg, axis=2)
-        count_bullet = np.sum((labels == idx_bullet) & mask_bg, axis=2)
-        
-        # Apply Grayscale Values
-        grid[count_brick > 1] = self.ID_MAP["brick"]
-        grid[count_steel > 2] = self.ID_MAP["steel"]
-        grid[count_eagle > 1] = self.ID_MAP["eagle"]
-        
-        # Dynamic objects (lower threshold)
-        grid[count_player > 0] = self.ID_MAP["player"]
-        grid[count_enemy > 0] = self.ID_MAP["enemy"]
-        grid[count_bullet > 0] = self.ID_MAP["bullet"]
-        
-        return grid
+    def get_tactical_rgb(self):
+        """Returns a downscaled 52x52 RGB tactical map for play.py."""
+        screen = self.raw_env.screen
+        board = screen[16:224, 16:224]  # 208x208 playfield
+        thumb = cv2.resize(board, (52, 52), interpolation=cv2.INTER_NEAREST)
+        return thumb
 
     def _get_obs(self):
-        current_map = self._get_tactical_map()
-        while len(self.frames) < self.STACK_SIZE:
-            self.frames.append(current_map)
-        self.frames.append(current_map)
-        obs_stack = np.stack(self.frames, axis=-1)
-        return obs_stack
+        """Returns the current screen, cropped to playfield, grayscale, resized to 128x128."""
+        # Get raw screen from nes_py (240, 256, 3)
+        screen = self.env.screen.copy()
+        
+        # Crop to playfield only (remove right sidebar + borders)
+        # Playfield: 13x13 tiles × 16px = 208x208, starts at ~(16, 8)
+        cropped = screen[16:224, 16:224]  # (208, 208, 3)
+        
+        # Convert to Grayscale
+        gray = cv2.cvtColor(cropped, cv2.COLOR_RGB2GRAY)
+        
+        # Resize to 128x128 (больше деталей чем 84x84)
+        resized = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_LINEAR)
+        
+        return np.expand_dims(resized, axis=-1)
 
-    def get_tactical_rgb(self):
-        if not self.frames: return np.zeros((52, 52, 3), dtype=np.uint8)
-        grid = self.frames[-1]
-        img = cv2.cvtColor(grid, cv2.COLOR_GRAY2RGB)
-        return img
+    def reset(self, **kwargs):
+        # Handle Gymnasium vs Gym API differences
+        # nes-py doesn't accept 'seed' or 'options' in reset()
+        if 'seed' in kwargs:
+            # We can use the seed to seed numpy if we want, but NESEnv might not support it directly
+            pass 
+        kwargs.pop('seed', None)
+        kwargs.pop('options', None)
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.raw_env.reset()
+
+        # We ignore the pixel observation returned by reset
+        _ = self.env.reset(**kwargs)
+        
+        # Skip Title Screen (Full 5-step sequence)
+        # NOTE: We use self.raw_env.step() to send RAW NES button presses,
+        # bypassing JoypadSpace and MultiDiscrete wrappers.
+        
+        # 1. Wait for Logo & Title
+        for _ in range(120): self.raw_env.step(0) 
+            
+        # 2. Press START (Skip Title, go to Player Select)
+        for _ in range(15): self.raw_env.step(8) 
+        for _ in range(40): self.raw_env.step(0) 
+
+        # Force Level Selection if specified
+        if self.start_level is not None:
+             target_val = self.start_level # RAM 1 = Stage 1
+             self.raw_env.ram[RLConfig.ADDR_STAGE] = target_val
+        
+        # 3. Press START (Select 1 Player, go to Stage Select)
+        for _ in range(15): self.raw_env.step(8)
+        for _ in range(40): self.raw_env.step(0)
+
+        # Re-enforce Level Selection just in case
+        if self.start_level is not None:
+             self.raw_env.ram[RLConfig.ADDR_STAGE] = self.start_level
+
+        # 4. Press START (Start Stage)
+        for _ in range(15): self.raw_env.step(8)
+        
+        # 5. Wait for Curtain to fully open and level to draw
+        for _ in range(100): self.raw_env.step(0)
+             
+        # Reset trackers
+        # Snapshot RAM kills after boot — treats any residual values as baseline (not new kills)
+        # Snapshot RAM kills after boot
+        self.prev_enemies_left = self.env.ram[0x80]
+        self.cumulative_kills = 0
+        self.death_count = 0
         self.steps_in_episode = 0
-        self.episode_score = 0.0
-        self.episode_kills = 0
-        self.level_cleared = False
-        self.base_active_latch = False # Reset Latch
-        self.ambush_triggered = False # Reset ambush
-        self.visited_sectors = set()
-        self.frames.clear()
+        # Initialize lives to ACTUAL value from RAM
+        self.prev_lives = self.env.ram[0x51]
         
-        # Start Sequence
-        for _ in range(80): self.raw_env.step(0)
-        for _ in range(10): self.raw_env.step(8)
-        for _ in range(30): self.raw_env.step(0)
-        for _ in range(10): self.raw_env.step(8)
-        for _ in range(30): self.raw_env.step(0)
-        for _ in range(10): self.raw_env.step(8)
-        for _ in range(60): self.raw_env.step(0)
+        # Reset Proximity Reward Tracker
+        self.prev_min_dist = self._get_nearest_dist()
+        self.prev_px = self.env.ram[RLConfig.ADDR_PLAYER_X]
+        self.prev_py = self.env.ram[RLConfig.ADDR_PLAYER_Y]
+        
+        # Exploration Tracker
+        self.visited_cells = set()
 
-        # --- CUSTOM ENEMY COUNT RAM HACK ---
-        if 0 < self.enemy_count < 20:
-            # Note: 0x80 is "Enemies Remaining to Spawn". 
-            # The game starts with 20. If we set it to (N-2), it will spawn roughly N.
-            # (Because 2-3 are usually already on screen or pending).
-            # This is an approximation.
-            target = max(0, self.enemy_count - 3) 
-            self.raw_env.ram[self.ADDR_ENEMIES_LEFT] = target
-            # Also clear any on screen if we want very few? No, let them spawn.
+        # Proximity Reward Logic
+        self.prev_min_dist = 999.0
+        self.prev_px = 0
+        self.prev_py = 0
+        
+        # Base Latch: 
+        # RAM[0x68] is 0 at boot, 80 when active, 0 when destroyed.
+        # We must wait for it to become non-zero (active) before checking for 0 (destroyed).
+        self.base_active = False 
+        
+        # Load Game Over template (REMOVED - Using RAM Logic)
+        self.game_over_template = None
+            
+        return self._get_obs()
 
-        # Init state
-        self.prev_lives = int(self.raw_env.ram[self.ADDR_LIVES])
-        self.prev_x = int(self.raw_env.ram[self.ADDR_X_ARR])
-        self.prev_y = int(self.raw_env.ram[self.ADDR_Y_ARR])
-        self.prev_stage = int(self.raw_env.ram[self.ADDR_STAGE]) # Track Stage
+    def _get_nearest_dist(self):
+        """Calculates distance to nearest active enemy."""
+        # Player coordinates (Center)
+        # RAM gives Top-Left. Sprite is 16x16. Center is +8.
+        px = float(self.env.ram[RLConfig.ADDR_PLAYER_X]) + 8.0
+        py = float(self.env.ram[RLConfig.ADDR_PLAYER_Y]) + 8.0
         
-        self.prev_kill_sum = sum([int(self.raw_env.ram[addr]) for addr in self.ADDR_KILLS])
-        self.prev_score_sum = sum([int(self.raw_env.ram[addr]) for addr in self.ADDR_SCORE])
+        min_dist = 999.0
+        found = False
 
-        self.idle_steps = 0
-        self.prev_min_dist = 999.0 # Reset distance tracker
+        # Iterate Enemy Slots 2 to 7
+        for i in range(2, 8):
+            # Check Status (Alive >= 128)
+            status = self.env.ram[RLConfig.ADDR_ENEMY_STATUS_BASE + i]
+            if status < 128:
+                continue
+            
+            # Enemy Coordinates
+            ex = float(self.env.ram[RLConfig.ADDR_COORD_X_BASE + i]) + 8.0
+            ey = float(self.env.ram[RLConfig.ADDR_COORD_Y_BASE + i]) + 8.0
+            
+            # Simple 0,0 check (sometimes happens during init)
+            if self.env.ram[RLConfig.ADDR_COORD_X_BASE + i] == 0 and self.env.ram[RLConfig.ADDR_COORD_Y_BASE + i] == 0:
+                continue
+            
+            # Euclidian Distance
+            d = np.sqrt((ex - px)**2 + (ey - py)**2)
+            if d < min_dist:
+                min_dist = d
+                found = True
+                
+        return min_dist if found else 999.0
+
+    def _check_game_over(self):
+        if self.game_over_template is None:
+            return False
+            
+        import cv2
+        # Get frame in BGR (nes-py render is RGB)
+        # NES native resolution is 256x240
+        frame_rgb = self.env.render(mode='rgb_array')
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         
-        # Track bricks for wall-breaking rewards
-        grid = self._get_tactical_map()
-        self.prev_brick_count = np.sum(grid == self.ID_MAP["brick"])
+        # Safety Check: Dimensions
+        # If template is larger than frame (e.g. 512x480 vs 256x240), we must downscale template
+        fh, fw = frame_bgr.shape[:2]
+        th, tw = self.game_over_template.shape[:2]
         
-        self.frames.clear()
-        return self._get_obs(), {}
+        template_to_use = self.game_over_template
+        if th > fh or tw > fw:
+             # Assuming 2x scale difference (common)
+             scale_x = fw / tw
+             scale_y = fh / th
+             scale = min(scale_x, scale_y)
+             new_w = int(tw * scale)
+             new_h = int(th * scale)
+             template_to_use = cv2.resize(self.game_over_template, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Template Matching
+        try:
+            res = cv2.matchTemplate(frame_bgr, template_to_use, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            
+            # Threshold 0.75 (slightly lower for robustness)
+            if max_val > 0.75:
+                return True
+        except Exception as e:
+            # print(f"Game Over Check Error: {e}")
+            pass
+            
+        return False
 
     def step(self, action):
-        nes_reward = 0.0
-        terminated = False
-        truncated = False
-        info = {}
+        self.steps_in_episode += 1
+        # We ignore the pixel observation returned by step
+        _, reward, done, info = self.env.step(action)
         
-        repeat = getattr(config, 'FRAME_SKIP', 4)
+        # Check for Visual Game Over
+        if not done:
+             # RAM Check for Base Destruction (0x68)
+             # Logic: 0 (Boot) -> 80 (Active) -> 0 (Destroyed)
+             base_status = self.env.ram[RLConfig.ADDR_BASE]
+             
+             if not self.base_active:
+                 if base_status != 0:
+                     self.base_active = True
+             else:
+                 # Base was active, now checking if destroyed
+                 if base_status == 0:
+                     done = True
+                     info['base_destroyed'] = True
         
-        ram = self.raw_env.ram
-        old_x, old_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
-
-        # --- MODE: No Shooting ---
-        if self.no_shooting:
-            # Remap fire actions to movement only
-            if action == 5:
-                action = 0
-            elif action >= 6 and action <= 9:
-                action = action - 5
-
-        for _ in range(repeat):
-            obs, r, d, i = self.env.step(action)
-            nes_reward += r 
-            if d:
-                terminated = True
-                break
+        # Check for Lives (0x51)
+        # If lives == 0, it means Game Over (or about to be)
+        if not done:
+            curr_lives = self.env.ram[RLConfig.ADDR_LIVES]
+            if curr_lives == 0:
+                done = True
+                info['game_over'] = True
         
-        # (Old Limit Logic Removed - Moved to End with Ambush)
-        # -------------------------------------------------
+        # Tracks metrics for info dict
+        curr_enemies_left = self.env.ram[0x80]
+        curr_lives = self.env.ram[RLConfig.ADDR_LIVES]
         
-        self.steps_in_episode += 1 
-        ram = self.raw_env.ram
-        reward = 0 
+        # Address 0x80 tracks remaining enemies from 20 down to 0
+        # If it decreases, it means we killed an enemy
+        if 0 <= curr_enemies_left < self.prev_enemies_left and self.prev_enemies_left <= 20:
+            new_kills = self.prev_enemies_left - curr_enemies_left
+            self.cumulative_kills += new_kills
         
-        # 0. State Tracking for Rewards
-        current_enemies = []
-        # Enemies are at slots 2-7 (Indices in RAM arrays)
-        # Slot 0 = P1, Slot 1 = P2, Slots 2-7 = Enemies
-        for i in range(2, 8): 
-            # Check Status at 0xA0 + i
-            # Status >= 0x80 means active tank. < 0x80 means empty or exploding.
-            if 0xA0 + i < 0x100:
-                st = int(ram[0xA0 + i])
-                e_hp = 1 if st >= 128 else 0 
-                # Optional: Check Armor at 0xA8 + i for armored tanks?
-                # But simple Alive/Dead is enough for rewards.
-            else:
-                e_hp = 0
-                
-            e_x  = int(ram[0x90 + i]) if 0x90 + i < 0x100 else 0
-            e_y  = int(ram[0x98 + i]) if 0x98 + i < 0x100 else 0
-            current_enemies.append({'hp': e_hp, 'x': e_x, 'y': e_y, 'id': i})
-
-        # ========================================
-        # OPTIMIZED REWARD LOGIC
-        # ========================================
+        # HUGE BONUS for Level Completion (20 Kills)
+        # In Battle City, winning a stage happens when 0 enemies are left
+        if not done and curr_enemies_left == 0 and self.prev_enemies_left > 0:
+             done = True
+             info['is_success'] = True
         
-        info['reward_events'] = [] # For visualization
-        
-        # --- REWARD 1: KILLS (+1 per kill) ---
-        curr_kill_sum = sum([int(ram[addr]) for addr in self.ADDR_KILLS])
-        diff = curr_kill_sum - self.prev_kill_sum
-        
-        if diff > 0:
-            reward += self.rew_kill * diff  # +1.0 per kill
-            self.episode_kills += diff
-            info['reward_events'].append(f"KILL (+{self.rew_kill * diff})")
+        # Track deaths
+        if curr_lives < self.prev_lives:
+            self.death_count += 1
             
-        self.prev_kill_sum = curr_kill_sum
+        # Exploration tracker (just for info)
+        px = self.env.ram[RLConfig.ADDR_PLAYER_X]
+        py = self.env.ram[RLConfig.ADDR_PLAYER_Y]
         
-        # --- REWARD 2: DEATH (-1 per death) ---
-        curr_lives = int(ram[self.ADDR_LIVES])
-        if curr_lives < 10 and self.prev_lives < 10:
-             if curr_lives < self.prev_lives:
-                reward += self.rew_death  # -2.0 per death
-                info['reward_events'].append(f"DIED ({self.rew_death})")
+        if 24 <= px <= 216 and 24 <= py <= 216:
+            grid_x = (px - 24) // 16
+            grid_y = (py - 24) // 16
+            cell_id = (grid_x, grid_y)
+            if cell_id not in self.visited_cells:
+                self.visited_cells.add(cell_id)
+        # --- Reward Calculation ---
+        kill_reward = 0.0
+        death_penalty = 0.0
+        
+        # Linear kill reward: 1st kill = +1, 2nd = +2, ..., 20th = +20
+        if 0 <= curr_enemies_left < self.prev_enemies_left and self.prev_enemies_left <= 20:
+            new_kills = self.prev_enemies_left - curr_enemies_left
+            for k in range(new_kills):
+                kill_num = self.cumulative_kills - new_kills + k + 1
+                kill_reward += float(kill_num)  # kill #1=+1, #2=+2, ...
+        
+        # Linear death penalty: 1st death = -1, 2nd = -2, 3rd = -3
+        if curr_lives < self.prev_lives:
+            death_penalty = -float(self.death_count)  # death_count already incremented above
+        
+        # Bonus for level completion
+        level_bonus = 10.0 if info.get('is_success', False) else 0.0
+        
+        # Penalty for base destruction
+        base_penalty = -5.0 if info.get('base_destroyed', False) else 0.0
+        
+        custom_reward = kill_reward + death_penalty + level_bonus + base_penalty
+        
+        # Update trackers
+        self.prev_enemies_left = curr_enemies_left
         self.prev_lives = curr_lives
         
-        # ========================================
-        # GAME STATE CHECKS (no reward, just termination)
-        # ========================================
+        # Info for debugging
+        info['kills'] = self.cumulative_kills
+        info['lives'] = curr_lives
+        info['exploration'] = len(self.visited_cells)
         
-        curr_stage = int(ram[self.ADDR_STAGE])
-        
-        # Victory: killed 20 enemies or stage changed
-        if self.enemy_count >= 20 and self.episode_kills >= 20 and not self.level_cleared:
-            self.level_cleared = True
-            terminated = True 
-            info['is_success'] = True
-            info['win_reason'] = 'kills_limit'
 
-        if curr_stage != self.prev_stage:
-             if not self.level_cleared and self.enemy_count >= 20:
-                 self.level_cleared = True
-                 info['is_success'] = True
-                 info['win_reason'] = 'stage_cleared'
-             terminated = True
+        
+        return self._get_obs(), custom_reward, done, info
+
+    def render(self, **kwargs):
+        # Explicit render handling
+        # if self.is_visible: ... removed for headless optimization
              
-        self.prev_stage = curr_stage
-        
-        # Game Over: no lives
-        if curr_lives == 0:
-            terminated = True
-            info['game_over_reason'] = 'no_lives'
+        # Also return frame if needed by callbacks (so VideoRecorder works if we use it)
+        mode = kwargs.get('mode', self.render_mode)
+        if mode == 'rgb_array':
+             return self.env.render(mode='rgb_array')
 
-        # Game Over: base destroyed
-        base_status = int(ram[self.ADDR_BASE_STATUS])
-        if base_status != 0: self.base_active_latch = True
-        if self.base_active_latch and base_status == 0:
-             terminated = True
-             reward += self.rew_base_lost  # -5.0 for losing base!
-             info['game_over_reason'] = 'base_destroyed'
-             info['reward_events'].append(f"BASE DESTROYED ({self.rew_base_lost})")
-             
-        # Track position for game mechanics (idle detection for truncation)
-        curr_x, curr_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
-        if abs(curr_x - old_x) > 2 or abs(curr_y - old_y) > 2:
-             self.visited_sectors.add((curr_x // 16, curr_y // 16))
-             self.idle_steps = 0
-        else:
-             self.idle_steps += 1
-             
-        # Idle timeout (truncation, no penalty)
-        if self.idle_steps > 5000:
-             truncated = True
-             info['game_over_reason'] = 'idle_timeout'
-        
-        # --- AMBUSH LOGIC & ENEMY CONTROL ---
-        
-        # 1. AMBUSH STATE MANAGEMENT
-        if self.exploration_trigger is not None:
-            explore_pct = len(self.visited_sectors) / 240.0
-            
-            if not self.ambush_triggered:
-                if explore_pct >= self.exploration_trigger:
-                    # --- TRIGGER ACTIVATED ---
-                    self.ambush_triggered = True
-                    info['reward_events'].append("AMBUSH STARTED! (ENEMIES ARRIVING)")
-                    
-                    # Teleport existing "held" enemies to battle positions
-                    # Spawn X Coords: 0, 128, 192 (Approximate standard spawns)
-                    spawn_x = [0, 128, 192]
-                    for i in range(2, 8): # Slots 2-7
-                        if ram[0xA0 + i] >= 128: # If alive
-                             target_x = spawn_x[(i-2) % 3]
-                             self.raw_env.ram[0x90 + i] = target_x # X
-                             self.raw_env.ram[0x98 + i] = 0        # Y (Top)
-                
-                else:
-                    # --- PRE-AMBUSH SUPPRESSION ---
-                    # Keep enemies alive but trapped/hidden at (0,0)
-                    for i in range(2, 8):
-                         # Slots 2-5 have HP/Status. 
-                         should_suppress = False
-                         
-                         if ram[0xA0 + i] >= 128: should_suppress = True
-                             
-                         if should_suppress:
-                              self.raw_env.ram[0x90 + i] = 0
-                              self.raw_env.ram[0x98 + i] = 0
-        
-        # 2. STANDARD LIMIT
-        apply_standard_limit = True
-        if self.exploration_trigger is not None and not self.ambush_triggered:
-             apply_standard_limit = False # Suppression already handling it
-             
-        if apply_standard_limit and self.enemy_count < 6:
-             # Kill excess slots
-             # Slots 2..7. If we want N enemies max.
-             # e.g. Count=2. We allow slots 2,3. Kill 4,5,6,7.
-             limit_idx = 2 + self.enemy_count 
-             for i in range(limit_idx, 8):
-                 if 0xA0 + i < 0x100: 
-                      self.raw_env.ram[0x90 + i] = 0
-                      self.raw_env.ram[0x98 + i] = 0
-                      self.raw_env.ram[0xA0 + i] = 0 # Kill status
-             
-             # Special Case: If 0 enemies
-             if self.enemy_count == 0:
-                 self.idle_steps = 0 
-        
-        info['exploration_pct'] = len(self.visited_sectors) / 240.0 # Corrected total
-        info['trigger_pct'] = self.exploration_trigger if self.exploration_trigger else 0.0
-        info['nes_reward'] = nes_reward
-        info['kills'] = self.episode_kills 
-        # Env Type: 0 = Peaceful/Sim/Simplified, 1 = Full Standard Combat
-        info['env_type'] = 1 if (self.enemy_count >= 20 and not self.no_shooting) else 0
+    @property
+    def raw_env(self):
+        """Expose the underlying NESEnv for RAM access."""
+        e = self.env
+        while hasattr(e, 'env'):
+            e = e.env
+        return e
 
+    @property
+    def render_mode(self):
+        return getattr(self, "_render_mode", None)
 
-        self.prev_x, self.prev_y = curr_x, curr_y
-        
-        if self.steps_in_episode >= self.MAX_STEPS:
-            truncated = True 
+    @render_mode.setter
+    def render_mode(self, value):
+        self._render_mode = value
 
-        self.episode_score += reward
-        info['score'] = self.episode_score
-        
-        # --- ENEMY DETECTION FOR VISUALIZATION ---
-        player_cv, enemies_data = self._detect_enemies()
-        info['player_cv'] = player_cv
-        info['enemy_positions'] = enemies_data
-        info['enemies_detected'] = len(enemies_data)
-        
-        if enemies_data:
-            p_x, p_y = int(ram[0x90]), int(ram[0x98])
-            dists = [np.sqrt((ex - p_x)**2 + (ey - p_y)**2) for (ex, ey, *_) in enemies_data]
-            info['closest_enemy_dist'] = min(dists)
-        else:
-            info['closest_enemy_dist'] = 999.0
-        
-        return self._get_obs(), reward, terminated, truncated, info
-
-    def render(self, mode='human'):
-        try:
-            return self.env.render(mode=mode)
-        except TypeError:
-            return self.env.render()
-
-    def cheat_clear_enemies(self):
-        """Debug tool: Clear all enemies by manipulating RAM."""
-        # 1. Reset spawn counter
-        self.raw_env.ram[self.ADDR_ENEMIES_LEFT] = 0
-        # 2. Reset on-screen counter
-        self.raw_env.ram[0x64] = 0 # TanksOnScreen address is actually not 0xA0, usually managed by engine.
-        # But we can kill individual tanks.
-        for i in range(2, 8):
-            self.raw_env.ram[0xA0 + i] = 0 # Status = 0 (Dead)
-            self.raw_env.ram[0x90 + i] = 0 # X=0
-            self.raw_env.ram[0x98 + i] = 0 # Y=0
-            
-    def close(self):
-        self.env.close()
-
-    # --- ENEMY DETECTION HELPER ---
-    def _detect_enemies(self):
-        """
-        Detects enemies using RAM (100% Accurate).
-        RAM Map:
-        X Coords: 0x90 (Player), 0x91-0x94 (Enemies)
-        Y Coords: 0x98 (Player), 0x99-0x9C (Enemies)
-        """
-        ram = self.raw_env.ram
-        screen = self.raw_env.screen
-        
-        # 1. Player (Slot 0)
-        px = int(ram[0x90])
-        py = int(ram[0x98])
-        player_pos = (px + 8, py + 8)  # Center of tank
-        
-        # 2. Enemies (Slots 2-7) - Battle City Standard
-        enemies = []
-        
-        for i in range(2, 8):  # Slots 2-7
-            # Check Status (Alive >= 128)
-            status = int(ram[0xA0 + i]) if 0xA0 + i < 0x100 else 0
-            if status < 128:
-                 continue
-                 
-            ex = int(ram[0x90 + i])
-            ey = int(ram[0x98 + i])
-            
-            # Skip empty slots (coords at 0,0) - Redundant if Status checked, but safe
-            if ex == 0 and ey == 0:
-                continue
-            
-            # --- LoS Check (Raycast) ---
-            is_visible = False
-            
-            # GAME MECHANIC: Axis Alignment (Tanks shoot straight)
-            dx = abs(ex - px)
-            dy = abs(ey - py)
-            is_aligned = (dx < 12) or (dy < 12)
-            
-            if is_aligned:
-                is_visible = True
-                # DENSER SAMPLING (10 points)
-                for t in np.linspace(0.1, 0.9, 10):
-                    sx = int(px + (ex - px) * t)
-                    sy = int(py + (ey - py) * t)
-                    if 0 <= sx < 256 and 0 <= sy < 240:
-                        pixel = screen[sy, sx]
-                        if pixel[0] > 60:  # Wall (Red channel high)
-                            is_visible = False
-                            break
-            
-            
-            # Format: (x_topleft, y_topleft, slot_id, status_byte, is_visible)
-            # Send raw coords (no +8)
-            enemies.append((ex, ey, i, status, is_visible))
-            
-        return player_pos, enemies
-
-    def _get_path_length_to_nearest_enemy(self, p_x, p_y, enemies):
-        """
-        Calculate BFS path length from player to nearest enemy.
-        Returns path length (in grid cells) or 999 if no path found.
-        """
-        if not enemies:
-            return 999
-        
-        try:
-            grid_map = self._get_tactical_map()
-        except:
-            return 999
-        
-        # Find nearest enemy by Euclidean (to pick target)
-        min_dist = 999.0
-        target_x, target_y = 0, 0
-        
-        for e in enemies:
-            if e['hp'] > 0 or (e['x'] != 0 or e['y'] != 0):
-                d = np.sqrt((e['x'] - p_x)**2 + (e['y'] - p_y)**2)
-                if d < min_dist:
-                    min_dist = d
-                    target_x, target_y = e['x'], e['y']
-        
-        if target_x == 0 and target_y == 0:
-            return 999
-        
-        # Convert to grid coords (52x52 over 208x208 play area)
-        # Map area: 16:224 pixels. Grid: 52 cells -> 4px per cell.
-        gx_start = max(0, min(51, int((p_x - 16) / 4)))
-        gy_start = max(0, min(51, int((p_y - 16) / 4)))
-        gx_end   = max(0, min(51, int((target_x - 16) / 4)))
-        gy_end   = max(0, min(51, int((target_y - 16) / 4)))
-        
-        # Quick BFS
-        queue = [(gx_start, gy_start, 0)]  # x, y, distance
-        visited = set([(gx_start, gy_start)])
-        
-        while queue:
-            cx, cy, dist = queue.pop(0)
-            
-            if cx == gx_end and cy == gy_end:
-                return dist
-            
-            if dist > 100:  # Limit search depth
-                continue
-            
-            for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < 52 and 0 <= ny < 52:
-                    if (nx, ny) not in visited:
-                        val = grid_map[ny, nx]
-                        # Passable: 0 (empty), 80 (enemy), 150 (player), 200 (brick)
-                        if val == 0 or val == 80 or val == 150 or val == 200:
-                            visited.add((nx, ny))
-                            queue.append((nx, ny, dist + 1))
-        
-        return 999  # No path found

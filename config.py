@@ -15,8 +15,24 @@ TOTAL_TIMESTEPS = 6_000_000
 # --- OBSERVATION ---
 STACK_SIZE = 4
 FRAME_SKIP = 4
-ROM_PATH = "BattleCity.nes"
-TARGET_STAGE = 0
+
+class RLConfig:
+    # Memory Addresses
+    ADDR_BASE = 0x68
+    ADDR_COORD_X_BASE = 0x90
+    ADDR_COORD_Y_BASE = 0x98
+    ADDR_ENEMY_STATUS_BASE = 0xA0
+    ADDR_KILLS = [0x73, 0x74, 0x75, 0x76]
+    ADDR_LIVES = 0x51
+    ADDR_PLAYER_X = 0x90
+    ADDR_PLAYER_Y = 0x98
+    ADDR_STAGE = 0x85
+    
+    # Paths
+    GAME_PATH = "BattleCity.nes"
+
+ROM_PATH = RLConfig.GAME_PATH
+TARGET_STAGE = 1
 
 USE_RECURRENT = False
 USE_TRANSFORMER = False

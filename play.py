@@ -73,26 +73,19 @@ def main():
     def make_env_for_mode(mode_name):
         variant = config.ENV_VARIANTS[mode_name]
         reward_profile = variant.get("reward_profile", "DEFAULT")
-        reward_config = config.REWARD_VARIANTS.get(reward_profile, None)
         
         print(f"Switching to Mode: {mode_name}")
-        print(f" - Enemies: {variant.get('enemy_count')}")
         print(f" - Profile: {reward_profile}")
         
         return BattleCityEnv(
-            render_mode='rgb_array', 
-            use_vision=False, 
-            enemy_count=variant.get("enemy_count", 20),
-            no_shooting=variant.get("no_shooting", False),
-            reward_config=reward_config,
-            exploration_trigger=variant.get("exploration_trigger", None)
+            render_mode='rgb_array',
         )
 
     # Initial Start (Default to PROFILE_EXPLORER if available, else STANDARD)
     start_mode = "PROFILE_EXPLORER" if "PROFILE_EXPLORER" in modes else "STANDARD"
     current_mode_idx = modes.index(start_mode)
     env = make_env_for_mode(start_mode)
-    obs, info = env.reset()
+    obs = env.reset()
     
     frame = env.raw_env.screen.copy()
     h, w, c = frame.shape
@@ -131,7 +124,7 @@ def main():
                     new_mode = modes[current_mode_idx]
                     env.close()
                     env = make_env_for_mode(new_mode)
-                    obs, info = env.reset()
+                    obs = env.reset()
                     msg_log.append(f"SWITCHED MODE: {new_mode}")
                 elif event.key == pygame.K_k: 
                     print("CHEAT: Clearing Enemies!")
@@ -157,22 +150,17 @@ def main():
             left, right = keys[pygame.K_LEFT], keys[pygame.K_RIGHT]
             fire = keys[pygame.K_z]
             
-            if up:
-                if fire: action = 6
-                else:    action = 1
-            elif down:
-                if fire: action = 7
-                else:    action = 2
-            elif left:
-                if fire: action = 8
-                else:    action = 3
-            elif right:
-                if fire: action = 9
-                else:    action = 4
-            elif fire:
-                action = 5
+            mov_act = 0
+            if up: mov_act = 1
+            elif down: mov_act = 2
+            elif left: mov_act = 3
+            elif right: mov_act = 4
+            
+            fire_act = 1 if fire else 0
+            action = [mov_act, fire_act]
                 
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs, reward, terminated, info = env.step(action)
+            truncated = False
             
             # Накапливаем награду и логируем события
             total_episode_reward += reward
@@ -543,7 +531,7 @@ def main():
             y_pos += 20
 
         pygame.display.flip()
-        clock.tick(30)
+        clock.tick(15)
 
     env.close()
     pygame.quit()
