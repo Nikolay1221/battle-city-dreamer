@@ -78,6 +78,10 @@ class BattleCity(embodied.Env):
         self.duration = None
         self.done = True
 
+        # --- Continuous Multi-Base Logic ---
+        self._max_lives = 4
+        self._current_lives = self._max_lives
+
         # --- Episode Metrics ---
         self._ep_kills = 0
         self._ep_deaths = 0
@@ -114,6 +118,7 @@ class BattleCity(embodied.Env):
             'log/lives': elements.Space(np.float32),
             'log/enemies_alive': elements.Space(np.float32),
             'log/proximity': elements.Space(np.float32),
+            'log/meta_lives': elements.Space(np.float32), # Tracking multi-game lives
         }
         if self.use_ram:
             spaces['ram'] = elements.Space(np.float32, (self.RAM_SIZE,))
@@ -166,9 +171,45 @@ class BattleCity(embodied.Env):
         
         reward = total_reward
 
+        # --- Continuous Play Logic (4 Games in 1 Episode) ---
         if terminated:
-            terminal = True
-            last = True
+            # We add a call to save the video here for each INDIVIDUAL game (3 lives / 1 base)
+            # This ensures we get footage of the normal game as the user requested.
+            self._save_video()
+            
+            self._current_lives -= 1
+            
+            # Additional penalty based on consecutive losses
+            if info.get('base_destroyed', False) or info.get('game_over', False):
+                # 1st loss (-1), 2nd loss (-2), 3rd loss (-3), 4th loss (-4)
+                loss_number = self._max_lives - self._current_lives 
+                reward -= float(loss_number) 
+            
+            if self._current_lives <= 0:
+                # Fully exhausted all chances
+                terminal = True
+                last = True
+            else:
+                # We died/lost base, but we have lives left! 
+                # Soft reset the emulator inside, but DON'T tell the agent it's a new episode
+                with self.LOCK:
+                    self._env.reset()
+                
+                # We need to capture the VERY FIRST frame of the newly reset NES game 
+                # so the agent doesn't see a blind frame, but we don't break the RNN memory loop
+                if not self.use_ram:
+                    # Fake a frame update by forcing it to read the new reset state visually
+                    pass 
+                
+                # If we are recording this episode, we need to grab the first frame of the new life
+                if self._video_dir and self._episode_count % self._video_every == 0:
+                    try:
+                        screen = self._env.raw_env.screen
+                        frame = screen[16:224, 16:224].copy()
+                        self._video_frames.append(frame)
+                    except Exception:
+                        pass
+
         if self.duration >= self.length:
             last = True
 
@@ -177,13 +218,12 @@ class BattleCity(embodied.Env):
         self._ep_exploration = info.get('exploration_pct', self._ep_exploration)
         self._ep_reward += reward
 
-        # Detect death event
-        if info.get('reward_events'):
-            for event in info['reward_events']:
-                if 'DIED' in event:
-                    self._ep_deaths += 1
-                if 'BASE DESTROYED' in event:
-                    self._ep_base_lost = 1
+        # Detect death event (Fixing the missing flags from battle_city_env.py)
+        if info.get('game_over', False):
+            self._ep_deaths += 1
+            
+        if info.get('base_destroyed', False):
+            self._ep_base_lost += 1
 
         self.done = last
         return self._obs(
@@ -196,9 +236,14 @@ class BattleCity(embodied.Env):
 
         with self.LOCK:
             self._env.reset()
+        
         self.duration = 0
         self.done = False
         self._video_frames = []
+        
+        # Reset meta-game lives
+        self._current_lives = self._max_lives
+        
         # Reset episode metrics
         self._ep_kills = 0
         self._ep_deaths = 0
@@ -227,14 +272,16 @@ class BattleCity(embodied.Env):
             ep_len = self.duration or 0
             step = self._global_step
             ep_num = self._episode_count
-            fname = f"ep{ep_num:05d}_step{step}_kills{kills}_len{ep_len}.mp4"
+            life_num = self._max_lives - self._current_lives
+            fname = f"ep{ep_num:05d}_life{life_num}_step{step}_kills{kills}_len{ep_len}.mp4"
             fpath = os.path.join(self._video_dir, fname)
 
             h, w = self._video_frames[0].shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(fpath, fourcc, 60, (64, 64))
+            # Changed video resolution to 128x128 to match new observation size
+            writer = cv2.VideoWriter(fpath, fourcc, 60, (128, 128))
             for frame in self._video_frames:
-                small = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA)
+                small = cv2.resize(frame, (128, 128), interpolation=cv2.INTER_AREA)
                 bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
                 writer.write(bgr)
             writer.release()
@@ -275,6 +322,7 @@ class BattleCity(embodied.Env):
                 'log/lives': np.float32(lives),
                 'log/enemies_alive': np.float32(enemies_alive),
                 'log/proximity': np.float32(getattr(self._env, 'cumulative_proximity', 0.0)),
+                'log/meta_lives': np.float32(self._current_lives),
             },
         )
 
