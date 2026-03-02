@@ -319,12 +319,24 @@ class BattleCityEnv(gym.Wrapper):
         kill_reward = 0.0
         death_penalty = 0.0
         
+        # Base (Eagle) is always at the bottom-center of the map
+        # Pixel coordinates: approximately X=112, Y=208
+        BASE_X = 112
+        BASE_Y = 208
+        PROXIMITY_RADIUS = 80  # ~5 blocks (5 * 16px). Kills beyond this = no reward.
+        
+        dist_to_base = abs(int(px) - BASE_X) + abs(int(py) - BASE_Y)
+        near_base = dist_to_base <= PROXIMITY_RADIUS
+        
         # Linear kill reward: 1st kill = +1, 2nd = +2, ..., 20th = +20
+        # BUT only if player is near the base!
         if 0 <= curr_enemies_left < self.prev_enemies_left and self.prev_enemies_left <= 20:
             new_kills = self.prev_enemies_left - curr_enemies_left
-            for k in range(new_kills):
-                kill_num = self.cumulative_kills - new_kills + k + 1
-                kill_reward += float(kill_num)  # kill #1=+1, #2=+2, ...
+            if near_base:
+                for k in range(new_kills):
+                    kill_num = self.cumulative_kills - new_kills + k + 1
+                    kill_reward += float(kill_num)  # kill #1=+1, #2=+2, ...
+            # If far from base: kill_reward stays 0.0 (no reward for distant kills)
         
         # Linear death penalty: 1st death = -1, 2nd = -2, 3rd = -3
         if curr_lives < self.prev_lives:
@@ -346,6 +358,8 @@ class BattleCityEnv(gym.Wrapper):
         info['kills'] = self.cumulative_kills
         info['lives'] = curr_lives
         info['exploration'] = len(self.visited_cells)
+        info['near_base'] = near_base
+        info['dist_to_base'] = dist_to_base
         
 
         

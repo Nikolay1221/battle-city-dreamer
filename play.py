@@ -531,7 +531,7 @@ def main():
             y_pos += 20
 
         pygame.display.flip()
-        clock.tick(15)
+        clock.tick(60)
 
     env.close()
     pygame.quit()

@@ -153,6 +153,20 @@ class BattleCity(embodied.Env):
         info = {}
         for _ in range(self.repeat):
             obs, rew, terminated, info = self._env.step(act)
+            
+            # --- Meta-Episode Kill Reward Scaling ---
+            current_inner_kills = info.get('kills', 0)
+            if current_inner_kills > self._prev_inner_kills:
+                new_kills = current_inner_kills - self._prev_inner_kills
+                # Add reward boost for meta-episode, but ONLY if near base
+                if info.get('near_base', True):
+                    extra_kill_reward = new_kills * float(self._meta_kills_offset)
+                    rew += extra_kill_reward
+                
+                # Update total logged kills (always count kills for stats)
+                self._ep_kills += new_kills
+                self._prev_inner_kills = current_inner_kills
+                
             total_reward += rew
             self.duration += 1
             self._global_step += 1
@@ -176,6 +190,10 @@ class BattleCity(embodied.Env):
             # We add a call to save the video here for each INDIVIDUAL game (3 lives / 1 base)
             # This ensures we get footage of the normal game as the user requested.
             self._save_video()
+            
+            # Update meta-kills offset for the next game
+            self._meta_kills_offset += info.get('kills', 0)
+            self._prev_inner_kills = 0
             
             self._current_lives -= 1
             
@@ -214,7 +232,6 @@ class BattleCity(embodied.Env):
             last = True
 
         # --- Extract metrics from info ---
-        self._ep_kills = info.get('kills', self._ep_kills)
         self._ep_exploration = info.get('exploration_pct', self._ep_exploration)
         self._ep_reward += reward
 
@@ -251,6 +268,10 @@ class BattleCity(embodied.Env):
         self._ep_exploration = 0.0
         self._ep_reward = 0.0
         self._ep_max_kill_reward = 0.0
+        
+        # Meta-kill tracker for continuous reward scaling
+        self._meta_kills_offset = 0
+        self._prev_inner_kills = 0
 
         # Capture first cropped frame
         if self._video_dir and self._episode_count % self._video_every == 0:
