@@ -132,9 +132,9 @@ class BattleCity(embodied.Env):
         return {
             'move': elements.Space(np.int32, (), 0, 5),
             'fire': elements.Space(np.int32, (), 0, 2),
-            # duration: 0=1 frame, 1=2 frames, ..., 9=10 frames
+            # duration: 0=1 frame, 1=2 frames, 2=4 frames, 3=8 frames
             # Agent decides how long to hold the button press
-            'duration': elements.Space(np.int32, (), 0, 10),
+            'duration': elements.Space(np.int32, (), 0, 4),
             'reset': elements.Space(bool),
         }
 
@@ -152,8 +152,8 @@ class BattleCity(embodied.Env):
 
         # Temporal Action Repeat: agent decides how long to hold the button
         # duration index: 0=1 frame, 1=2 frames, 2=4 frames, 3=8 frames
-        DURATION_MAP = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        dur_idx = int(action.get('duration', 4))  # default = 5 frames if not specified
+        DURATION_MAP = [1, 2, 4, 8]
+        dur_idx = int(action.get('duration', 2))  # default = 4 frames
         n_repeat = DURATION_MAP[min(dur_idx, len(DURATION_MAP) - 1)]
 
         # Action repeat: execute the same action for N frames
