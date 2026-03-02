@@ -165,10 +165,12 @@ class BattleCity(embodied.Env):
                 
                 # Update total logged kills (always count kills for stats)
                 self._ep_kills += new_kills
+                self._life_kills += new_kills
                 self._prev_inner_kills = current_inner_kills
                 
             total_reward += rew
             self.duration += 1
+            self._life_duration += 1
             self._global_step += 1
 
             # Capture cropped playfield frame for video
@@ -212,6 +214,10 @@ class BattleCity(embodied.Env):
                 # Soft reset the emulator inside, but DON'T tell the agent it's a new episode
                 with self.LOCK:
                     self._env.reset()
+                
+                # Reset per-life metrics for the new game
+                self._life_kills = 0
+                self._life_duration = 0
                 
                 # We need to capture the VERY FIRST frame of the newly reset NES game 
                 # so the agent doesn't see a blind frame, but we don't break the RNN memory loop
@@ -261,13 +267,17 @@ class BattleCity(embodied.Env):
         # Reset meta-game lives
         self._current_lives = self._max_lives
         
-        # Reset episode metrics
+        # Reset episode metrics (cumulative across all 4 games)
         self._ep_kills = 0
         self._ep_deaths = 0
         self._ep_base_lost = 0
         self._ep_exploration = 0.0
         self._ep_reward = 0.0
         self._ep_max_kill_reward = 0.0
+        
+        # Per-life metrics (reset on each soft-reset for video naming)
+        self._life_kills = 0
+        self._life_duration = 0
         
         # Meta-kill tracker for continuous reward scaling
         self._meta_kills_offset = 0
@@ -289,8 +299,8 @@ class BattleCity(embodied.Env):
         if not self._video_dir or len(self._video_frames) < 2:
             return
         try:
-            kills = self._ep_kills
-            ep_len = self.duration or 0
+            kills = self._life_kills
+            ep_len = self._life_duration
             step = self._global_step
             ep_num = self._episode_count
             life_num = self._max_lives - self._current_lives
