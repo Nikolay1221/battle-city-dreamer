@@ -323,20 +323,22 @@ class BattleCityEnv(gym.Wrapper):
         # Pixel coordinates: approximately X=112, Y=208
         BASE_X = 112
         BASE_Y = 208
-        PROXIMITY_RADIUS = 80  # ~5 blocks (5 * 16px). Kills beyond this = no reward.
+        # Max possible Manhattan distance from base to far corner (~320px)
+        MAX_DIST = 320.0
         
         dist_to_base = abs(int(px) - BASE_X) + abs(int(py) - BASE_Y)
-        near_base = dist_to_base <= PROXIMITY_RADIUS
+        # Proximity factor: 1.0 at base, 0.0 at max distance (linear gradient)
+        proximity_factor = max(0.0, 1.0 - dist_to_base / MAX_DIST)
+        # Keep near_base flag for meta-kill gating in Dreamer wrapper
+        near_base = dist_to_base <= 80
         
         # Linear kill reward: 1st kill = +1, 2nd = +2, ..., 20th = +20
-        # BUT only if player is near the base!
+        # Scaled by proximity to base: further away = smaller reward
         if 0 <= curr_enemies_left < self.prev_enemies_left and self.prev_enemies_left <= 20:
             new_kills = self.prev_enemies_left - curr_enemies_left
-            if near_base:
-                for k in range(new_kills):
-                    kill_num = self.cumulative_kills - new_kills + k + 1
-                    kill_reward += float(kill_num)  # kill #1=+1, #2=+2, ...
-            # If far from base: kill_reward stays 0.0 (no reward for distant kills)
+            for k in range(new_kills):
+                kill_num = self.cumulative_kills - new_kills + k + 1
+                kill_reward += float(kill_num) * proximity_factor  # scaled by distance
         
         # Linear death penalty: 1st death = -1, 2nd = -2, 3rd = -3
         if curr_lives < self.prev_lives:
