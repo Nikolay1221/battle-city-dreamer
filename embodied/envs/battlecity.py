@@ -186,6 +186,7 @@ class BattleCity(embodied.Env):
                 break
         
         reward = total_reward
+        self._life_reward += reward
 
         # --- Continuous Play Logic (4 Games in 1 Episode) ---
         if terminated:
@@ -218,6 +219,7 @@ class BattleCity(embodied.Env):
                 # Reset per-life metrics for the new game
                 self._life_kills = 0
                 self._life_duration = 0
+                self._life_reward = 0.0
                 
                 # We need to capture the VERY FIRST frame of the newly reset NES game 
                 # so the agent doesn't see a blind frame, but we don't break the RNN memory loop
@@ -278,6 +280,7 @@ class BattleCity(embodied.Env):
         # Per-life metrics (reset on each soft-reset for video naming)
         self._life_kills = 0
         self._life_duration = 0
+        self._life_reward = 0.0
         
         # Meta-kill tracker for continuous reward scaling
         self._meta_kills_offset = 0
@@ -301,10 +304,11 @@ class BattleCity(embodied.Env):
         try:
             kills = self._life_kills
             ep_len = self._life_duration
+            score = int(self._life_reward)
             step = self._global_step
             ep_num = self._episode_count
             life_num = self._max_lives - self._current_lives
-            fname = f"ep{ep_num:05d}_life{life_num}_step{step}_kills{kills}_len{ep_len}.mp4"
+            fname = f"ep{ep_num:05d}_life{life_num}_step{step}_kills{kills}_score{score}_len{ep_len}.mp4"
             fpath = os.path.join(self._video_dir, fname)
 
             h, w = self._video_frames[0].shape[:2]
