@@ -78,10 +78,6 @@ class BattleCity(embodied.Env):
         self.duration = None
         self.done = True
 
-        # --- Continuous Multi-Base Logic ---
-        self._max_lives = 3
-        self._current_lives = self._max_lives
-
         # --- Episode Metrics ---
         self._ep_kills = 0
         self._ep_deaths = 0
@@ -167,12 +163,10 @@ class BattleCity(embodied.Env):
             if current_inner_kills > self._prev_inner_kills:
                 new_kills = current_inner_kills - self._prev_inner_kills
                 self._ep_kills += new_kills
-                self._life_kills += new_kills
                 self._prev_inner_kills = current_inner_kills
                 
             total_reward += rew
             self.duration += 1
-            self._life_duration += 1
             self._global_step += 1
 
             # Capture cropped playfield frame for video
@@ -188,19 +182,11 @@ class BattleCity(embodied.Env):
                 break
         
         reward = total_reward
-        self._life_reward += reward
 
-        # --- Continuous Play Logic (4 Games in 1 Episode) ---
+        # --- Episode End ---
         if terminated:
-            # We add a call to save the video here for each INDIVIDUAL game (3 lives / 1 base)
-            # This ensures we get footage of the normal game as the user requested.
             self._save_video()
-            
-            # Update meta-kills offset for the next game
-            self._meta_kills_offset = 0 # RESET OFFSET SO KILLS ALWAYS SCALE 1-20
             self._prev_inner_kills = 0
-            
-            # Additional penalty based on consecutive losses REMOVED
             terminal = True
             last = True
 
@@ -241,10 +227,6 @@ class BattleCity(embodied.Env):
         self._ep_base_lost = 0
         self._ep_exploration = 0.0
         self._ep_reward = 0.0
-        self._ep_max_kill_reward = 0.0
-        
-        # Meta-kill tracker for continuous reward scaling
-        self._meta_kills_offset = 0
         self._prev_inner_kills = 0
 
         # Capture first cropped frame
