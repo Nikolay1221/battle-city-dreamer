@@ -206,7 +206,7 @@ battlecity_ram:
   task: battlecity_ram_stage0
   run: {steps: 5e6, envs: 16, train_ratio: 32}
   <<: *size25m
-  env.battlecity: {repeat: 4, use_logdir: True, video_every: 0}
+  env.battlecity: {repeat: 1, use_logdir: True, video_every: 1}
   agent:
     imag_length: 64
     horizon: 333
