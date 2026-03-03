@@ -131,7 +131,13 @@ def main():
                     # env.cheat_clear_enemies() # Not implemented in base env yet
                     pass 
                 elif event.key == pygame.K_j:
-                    pass
+                    print("CHEAT: SPAWN SHOVEL!")
+                    env.raw_env.ram[0x88] = 2 # Shovel Powerup
+                    env.raw_env.ram[0x86] = env.raw_env.ram[0x90]
+                    env.raw_env.ram[0x87] = env.raw_env.ram[0x98]
+                elif event.key == pygame.K_l:
+                    print(f"CHEAT: TIMER = {env.raw_env.ram[0x45]}")
+                    env.raw_env.ram[0x45] = 20
         
         # Input
         keys = pygame.key.get_pressed()

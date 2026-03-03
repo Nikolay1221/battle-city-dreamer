@@ -8,6 +8,7 @@ NUM_CPU = 8  # Используем все ядра для сбора опыта
 NUM_VIRTUAL = 2
 
 HEADLESS_MODE = False
+INVULNERABLE_BASE = True
 
 # --- TRAINING DURATION ---
 TOTAL_TIMESTEPS = 6_000_000

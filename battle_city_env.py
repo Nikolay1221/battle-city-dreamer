@@ -276,6 +276,18 @@ class BattleCityEnv(gym.Wrapper):
                  if base_status == 0:
                      done = True
                      info['base_destroyed'] = True
+                     
+                 # INVULNERABLE BASE CHEAT
+                 # Uses the game's native "Shovel" (Лопата) bonus mechanically
+                 import config
+                 if getattr(config, 'INVULNERABLE_BASE', False) and not done:
+                     # 0x45 is the HQArmour_Timer. If it falls low, we re-apply the Shovel
+                     if self.env.ram[0x45] < 5:
+                         self.env.ram[0x88] = 2 # Shovel Powerup (ID 2)
+                         self.env.ram[0x86] = self.env.ram[0x90] # X to Player
+                         self.env.ram[0x87] = self.env.ram[0x98] # Y to Player
+                     else:
+                         self.env.ram[0x45] = 20 # Freeze timer so it never disappears
         
         # Check for Lives (0x51)
         # If lives == 0, it means Game Over (or about to be)
