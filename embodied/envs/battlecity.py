@@ -79,7 +79,7 @@ class BattleCity(embodied.Env):
         self.done = True
 
         # --- Continuous Multi-Base Logic ---
-        self._max_lives = 4
+        self._max_lives = 3
         self._current_lives = self._max_lives
 
         # --- Episode Metrics ---
@@ -118,7 +118,6 @@ class BattleCity(embodied.Env):
             'log/lives': elements.Space(np.float32),
             'log/enemies_alive': elements.Space(np.float32),
             'log/proximity': elements.Space(np.float32),
-            'log/meta_lives': elements.Space(np.float32), # Tracking multi-game lives
         }
         if self.use_ram:
             spaces['ram'] = elements.Space(np.float32, (self.RAM_SIZE,))
@@ -163,16 +162,10 @@ class BattleCity(embodied.Env):
         for _ in range(n_repeat):
             obs, rew, terminated, info = self._env.step(act)
             
-            # --- Meta-Episode Kill Reward Scaling ---
+            # --- Update total logged kills (always count kills for stats) ---
             current_inner_kills = info.get('kills', 0)
             if current_inner_kills > self._prev_inner_kills:
                 new_kills = current_inner_kills - self._prev_inner_kills
-                # Add reward boost for meta-episode, but ONLY if near base
-                if info.get('near_base', True):
-                    extra_kill_reward = new_kills * float(self._meta_kills_offset)
-                    rew += extra_kill_reward
-                
-                # Update total logged kills (always count kills for stats)
                 self._ep_kills += new_kills
                 self._life_kills += new_kills
                 self._prev_inner_kills = current_inner_kills
@@ -204,46 +197,13 @@ class BattleCity(embodied.Env):
             self._save_video()
             
             # Update meta-kills offset for the next game
-            self._meta_kills_offset += info.get('kills', 0)
+            self._meta_kills_offset = 0 # RESET OFFSET SO KILLS ALWAYS SCALE 1-20
             self._prev_inner_kills = 0
             
-            self._current_lives -= 1
-            
-            # Additional penalty based on consecutive losses
-            if info.get('base_destroyed', False) or info.get('game_over', False):
-                # 1st loss (-1), 2nd loss (-2), 3rd loss (-3), 4th loss (-4)
-                loss_number = self._max_lives - self._current_lives 
-                reward -= float(loss_number) 
-            
-            if self._current_lives <= 0:
-                # Fully exhausted all chances
-                terminal = True
-                last = True
-            else:
-                # We died/lost base, but we have lives left! 
-                # Soft reset the emulator inside, but DON'T tell the agent it's a new episode
-                with self.LOCK:
-                    self._env.reset()
-                
-                # Reset per-life metrics for the new game
-                self._life_kills = 0
-                self._life_duration = 0
-                self._life_reward = 0.0
-                
-                # We need to capture the VERY FIRST frame of the newly reset NES game 
-                # so the agent doesn't see a blind frame, but we don't break the RNN memory loop
-                if not self.use_ram:
-                    # Fake a frame update by forcing it to read the new reset state visually
-                    pass 
-                
-                # If we are recording this episode, we need to grab the first frame of the new life
-                if self._video_dir and self._episode_count % self._video_every == 0:
-                    try:
-                        screen = self._env.raw_env.screen
-                        frame = screen[16:224, 16:224].copy()
-                        self._video_frames.append(frame)
-                    except Exception:
-                        pass
+            # Additional penalty based on consecutive losses REMOVED
+            terminal = True
+            last = True
+
 
         if self.duration >= self.length:
             last = True
@@ -275,21 +235,13 @@ class BattleCity(embodied.Env):
         self.done = False
         self._video_frames = []
         
-        # Reset meta-game lives
-        self._current_lives = self._max_lives
-        
-        # Reset episode metrics (cumulative across all 4 games)
+        # Reset episode metrics
         self._ep_kills = 0
         self._ep_deaths = 0
         self._ep_base_lost = 0
         self._ep_exploration = 0.0
         self._ep_reward = 0.0
         self._ep_max_kill_reward = 0.0
-        
-        # Per-life metrics (reset on each soft-reset for video naming)
-        self._life_kills = 0
-        self._life_duration = 0
-        self._life_reward = 0.0
         
         # Meta-kill tracker for continuous reward scaling
         self._meta_kills_offset = 0
@@ -311,13 +263,12 @@ class BattleCity(embodied.Env):
         if not self._video_dir or len(self._video_frames) < 2:
             return
         try:
-            kills = self._life_kills
-            ep_len = self._life_duration
-            score = int(self._life_reward)
+            kills = self._ep_kills
+            ep_len = self.duration
+            score = int(self._ep_reward)
             step = self._global_step
             ep_num = self._episode_count
-            life_num = self._max_lives - self._current_lives
-            fname = f"ep{ep_num:05d}_life{life_num}_step{step}_kills{kills}_score{score}_len{ep_len}.mp4"
+            fname = f"ep{ep_num:05d}_step{step}_kills{kills}_score{score}_len{ep_len}.mp4"
             fpath = os.path.join(self._video_dir, fname)
 
             h, w = self._video_frames[0].shape[:2]
@@ -366,7 +317,6 @@ class BattleCity(embodied.Env):
                 'log/lives': np.float32(lives),
                 'log/enemies_alive': np.float32(enemies_alive),
                 'log/proximity': np.float32(getattr(self._env, 'cumulative_proximity', 0.0)),
-                'log/meta_lives': np.float32(self._current_lives),
             },
         )
 

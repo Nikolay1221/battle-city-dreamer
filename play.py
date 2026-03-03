@@ -169,6 +169,8 @@ def main():
             truncated = False
             
             # Накапливаем награду и логируем события
+            if reward != 0:
+                print(f"RAW REWARD THIS FRAME: {reward}")
             total_episode_reward += reward
             events = info.get('reward_events', [])
             for e in events:

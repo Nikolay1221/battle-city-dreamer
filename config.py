@@ -53,16 +53,16 @@ REWARD_VARIANTS = {
     "DEFAULT": {
         # Balanced: Map control (0.03 * 400 cells = 12 pts) is roughly equal to ~12 Kills.
         # Encourages moving out of base.
-        "kill": 1.0, "death": -1.0, "base": -100.0, "explore": 0.05, "win": 20.0, "time": -0.0001, "distance": 0.01
+        "kill": 1.0, "death": 1.0, "base": -100.0, "explore": 0.05, "win": 20.0, "time": -0.0001, "distance": 0.01
     },
     "EXPLORER": {
-        "kill": 0.1, "death": -0.5, "base": -5.0, "explore": 0.05, "win": 10.0, "time": -0.005, "distance": 0.01
+        "kill": 1.0, "death": 1.0, "base": -5.0, "explore": 0.05, "win": 10.0, "time": -0.005, "distance": 0.01
     },
     "SURVIVOR": {
-        "kill": 1.0, "death": -5.0, "base": -30.0, "explore": 0.0, "win": 50.0, "time": 0.0, "distance": 0.0
+        "kill": 1.0, "death": 1.0, "base": -30.0, "explore": 0.0, "win": 50.0, "time": 0.0, "distance": 0.0
     },
     "AGGRESSIVE": {
-        "kill": 1.0, "death": -1.0, "base": -20.0, "explore": 0.1, "win": 20.0, "time": -0.01, "distance": 0.02
+        "kill": 1.0, "death": 1.0, "base": -20.0, "explore": 0.1, "win": 20.0, "time": -0.01, "distance": 0.02
     }
 }
 

@@ -345,16 +345,23 @@ class BattleCityEnv(gym.Wrapper):
         near_base = dist_to_base <= 80
         
         # Linear kill reward: 1st kill = +1, 2nd = +2, ..., 20th = +20
-        # Scaled by proximity to base: further away = smaller reward
+        # Explicitly requested by user: pure +1, +2, +3 logic, no distance scaling.
         if 0 <= curr_enemies_left < self.prev_enemies_left and self.prev_enemies_left <= 20:
             new_kills = self.prev_enemies_left - curr_enemies_left
-            for k in range(new_kills):
-                kill_num = self.cumulative_kills - new_kills + k + 1
-                kill_reward += float(kill_num) * proximity_factor  # scaled by distance
-        
+            for _ in range(new_kills):
+                # The kill we are currently processing
+                current_kill_num = self.cumulative_kills - new_kills + 1 
+                # Avoid calculating past 20 (or less than 1) just in case
+                if current_kill_num < 1: current_kill_num = 1
+                if current_kill_num > 20: current_kill_num = 20
+                
+                kill_reward += float(current_kill_num)
+                # Ensure the loop counts up properly if new_kills > 1
+                new_kills -= 1 
         # Linear death penalty: 1st death = -1, 2nd = -2, 3rd = -3
         if curr_lives < self.prev_lives:
-            death_penalty = -float(self.death_count)  # death_count already incremented above
+            # death_count was already incremented above, so it directly represents 1, 2, or 3
+            death_penalty = -float(self.death_count)
         
         # Bonus for level completion
         level_bonus = 10.0 if info.get('is_success', False) else 0.0
